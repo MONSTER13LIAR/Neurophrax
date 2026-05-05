@@ -1,256 +1,252 @@
 """
 Neurophrax MCP Server
-Synthetic healthcare data only — not for clinical use.
+Live medical data from OpenFDA, RxNorm, and SNOMED CT APIs.
 """
 
+import asyncio
+import httpx
 from typing import Annotated
 from pydantic import Field
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP(
     "Neurophrax",
-    instructions="Synthetic healthcare assistant. All data is fictional and for educational/demo purposes only.",
+    instructions=(
+        "Healthcare assistant backed by live OpenFDA, RxNorm, and SNOMED CT data. "
+        "For educational and informational use only — not for clinical decisions."
+    ),
 )
 
-# ── Synthetic Data ─────────────────────────────────────────────────────────────
+RXNORM_BASE = "https://rxnav.nlm.nih.gov/REST"
+OPENFDA_BASE = "https://api.fda.gov/drug"
+SNOMED_BASE = "https://browser.ihtsdotools.org/snowstorm/snomed-ct/MAIN"
+TIMEOUT = 15.0
 
-DRUG_INTERACTIONS: dict[frozenset, dict] = {
-    frozenset(["warfarin", "aspirin"]): {
-        "severity": "DANGEROUS",
-        "effect": "Concurrent use greatly increases hemorrhage risk — aspirin inhibits platelet aggregation",
-        "recommendation": "Avoid combination. Use acetaminophen for pain if anticoagulation is needed.",
-    },
-    frozenset(["warfarin", "ibuprofen"]): {
-        "severity": "DANGEROUS",
-        "effect": "NSAIDs displace warfarin from plasma proteins, raising free-drug levels and bleeding risk",
-        "recommendation": "Use acetaminophen instead. Monitor INR closely if NSAID unavoidable.",
-    },
-    frozenset(["metformin", "alcohol"]): {
-        "severity": "DANGEROUS",
-        "effect": "Alcohol inhibits gluconeogenesis and raises lactic acid — lactic acidosis risk is potentially fatal",
-        "recommendation": "Avoid all alcohol while on metformin.",
-    },
-    frozenset(["lisinopril", "potassium"]): {
-        "severity": "HIGH",
-        "effect": "ACE inhibitors reduce potassium excretion; supplements can cause life-threatening hyperkalemia",
-        "recommendation": "Avoid potassium supplements unless prescribed. Monitor serum potassium regularly.",
-    },
-    frozenset(["sertraline", "tramadol"]): {
-        "severity": "DANGEROUS",
-        "effect": "Both increase serotonergic activity — serotonin syndrome risk (hyperthermia, seizures, death)",
-        "recommendation": "Do not combine. Use a non-serotonergic analgesic.",
-    },
-    frozenset(["simvastatin", "amiodarone"]): {
-        "severity": "HIGH",
-        "effect": "Amiodarone inhibits CYP3A4, raising simvastatin plasma levels — myopathy and rhabdomyolysis risk",
-        "recommendation": "Lower simvastatin dose (max 20 mg/day) or switch to a non-CYP3A4-metabolised statin.",
-    },
-    frozenset(["ciprofloxacin", "antacids"]): {
-        "severity": "MODERATE",
-        "effect": "Divalent cations in antacids chelate ciprofloxacin, reducing absorption by up to 90%",
-        "recommendation": "Take ciprofloxacin 2 h before or 6 h after antacids.",
-    },
-    frozenset(["atorvastatin", "clarithromycin"]): {
-        "severity": "HIGH",
-        "effect": "CYP3A4 inhibition by clarithromycin raises atorvastatin AUC — increased myopathy risk",
-        "recommendation": "Withhold atorvastatin for the duration of antibiotic course.",
-    },
-    frozenset(["clopidogrel", "omeprazole"]): {
-        "severity": "MODERATE",
-        "effect": "Omeprazole inhibits CYP2C19, reducing clopidogrel conversion to active metabolite",
-        "recommendation": "Use pantoprazole as a safer gastroprotective alternative.",
-    },
-    frozenset(["lithium", "ibuprofen"]): {
-        "severity": "HIGH",
-        "effect": "NSAIDs reduce renal lithium clearance, causing toxic lithium accumulation",
-        "recommendation": "Use acetaminophen. Monitor lithium levels if NSAID is unavoidable.",
-    },
-    frozenset(["sildenafil", "nitrates"]): {
-        "severity": "DANGEROUS",
-        "effect": "Synergistic vasodilation causes severe, potentially fatal hypotension",
-        "recommendation": "Absolute contraindication — never combine.",
-    },
-}
 
-SYMPTOMS_TO_CONDITIONS: dict[str, list[str]] = {
-    "fever": ["Influenza", "COVID-19", "Bacterial Infection", "Sepsis (if high-grade ⚠️)"],
-    "cough": ["Common Cold", "Influenza", "COVID-19", "Bronchitis", "Pneumonia"],
-    "fatigue": ["Anemia", "Hypothyroidism", "Type 2 Diabetes", "Depression", "Chronic Fatigue Syndrome"],
-    "chest pain": ["Angina Pectoris", "Myocardial Infarction ⚠️", "Costochondritis", "GERD", "Panic Disorder"],
-    "shortness of breath": ["Asthma", "COPD", "Heart Failure", "Pulmonary Embolism ⚠️", "Anemia"],
-    "headache": ["Tension Headache", "Migraine", "Hypertension", "Dehydration", "Meningitis (if severe ⚠️)"],
-    "nausea": ["Gastroenteritis", "Food Poisoning", "Pregnancy", "Medication Side Effect", "Appendicitis ⚠️"],
-    "dizziness": ["Benign Positional Vertigo", "Orthostatic Hypotension", "Anemia", "Inner Ear Infection"],
-    "joint pain": ["Osteoarthritis", "Rheumatoid Arthritis", "Gout", "Lupus", "Lyme Disease"],
-    "rash": ["Allergic Reaction", "Eczema", "Psoriasis", "Contact Dermatitis", "Drug Reaction"],
-    "abdominal pain": ["IBS", "Appendicitis ⚠️", "Peptic Ulcer", "Gallstones", "Crohn's Disease"],
-    "frequent urination": ["Type 2 Diabetes", "UTI", "Overactive Bladder", "Prostate Hyperplasia"],
-    "weight loss": ["Hyperthyroidism", "Type 1 Diabetes", "Malignancy ⚠️", "Depression", "Malabsorption"],
-    "palpitations": ["Atrial Fibrillation ⚠️", "Anxiety", "Hyperthyroidism", "Anemia", "Excessive Caffeine"],
-    "blurred vision": ["Diabetes (retinopathy)", "Hypertension", "Glaucoma", "Cataracts", "Stroke ⚠️"],
-    "swelling": ["Heart Failure", "DVT ⚠️", "Kidney Disease", "Venous Insufficiency", "Medication Side Effect"],
-}
+async def _get(url: str, params: dict | None = None) -> dict:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        return r.json()
 
-MEDICATIONS: dict[str, dict] = {
-    "metformin": {
-        "generic": "Metformin HCl",
-        "drug_class": "Biguanide — Antidiabetic",
-        "dosage": "500–1000 mg twice daily (max 2550 mg/day)",
-        "timing": "Take with meals to minimise GI side effects",
-        "reminders": ["After breakfast (08:00)", "After dinner (18:00)"],
-        "side_effects": ["Nausea", "Diarrhoea", "Stomach upset", "Lactic acidosis (rare)"],
-        "monitoring": "Fasting glucose & HbA1c every 3 months; renal function annually",
-        "storage": "Room temperature, away from moisture",
-    },
-    "lisinopril": {
-        "generic": "Lisinopril",
-        "drug_class": "ACE Inhibitor — Antihypertensive",
-        "dosage": "10–40 mg once daily",
-        "timing": "Same time each day; morning preferred",
-        "reminders": ["Morning with or without food (08:00)"],
-        "side_effects": ["Dry cough", "Dizziness on standing", "Hyperkalemia"],
-        "monitoring": "Blood pressure daily; renal function & serum potassium at 1–2 weeks and periodically",
-        "storage": "Room temperature",
-    },
-    "atorvastatin": {
-        "generic": "Atorvastatin calcium",
-        "drug_class": "HMG-CoA Reductase Inhibitor — Statin",
-        "dosage": "10–80 mg once daily",
-        "timing": "Any time of day; evening slightly preferred",
-        "reminders": ["Evening (21:00)"],
-        "side_effects": ["Myalgia", "Elevated liver enzymes", "GI upset"],
-        "monitoring": "Fasting lipid panel at 6 weeks, then every 3–6 months; CK if muscle symptoms arise",
-        "storage": "Room temperature",
-    },
-    "warfarin": {
-        "generic": "Warfarin sodium",
-        "drug_class": "Vitamin K Antagonist — Anticoagulant",
-        "dosage": "Individualised by INR target (typical 2–10 mg/day)",
-        "timing": "Same time every evening",
-        "reminders": ["Evening (18:00) — CRITICAL: never skip or double dose"],
-        "side_effects": ["Bruising", "Prolonged bleeding", "Hair thinning"],
-        "monitoring": "INR every 1–4 weeks; maintain consistent Vitamin K dietary intake",
-        "storage": "Room temperature, protect from light",
-    },
-    "sertraline": {
-        "generic": "Sertraline HCl",
-        "drug_class": "SSRI — Antidepressant / Anxiolytic",
-        "dosage": "50–200 mg once daily",
-        "timing": "Morning or evening; consistency matters more than time of day",
-        "reminders": ["Morning with breakfast (08:00)"],
-        "side_effects": ["Nausea (first 1–2 weeks)", "Insomnia", "Reduced libido"],
-        "monitoring": "Assess mood and suicidality at 2 and 4 weeks; therapeutic effect in 4–6 weeks",
-        "storage": "Room temperature",
-    },
-    "amoxicillin": {
-        "generic": "Amoxicillin trihydrate",
-        "drug_class": "Penicillin Antibiotic",
-        "dosage": "250–500 mg every 8 h  OR  500–875 mg every 12 h",
-        "timing": "With or without food; complete the full prescribed course",
-        "reminders": ["08:00", "16:00", "00:00  (if 8-hourly dosing)"],
-        "side_effects": ["Diarrhoea", "Rash", "Nausea"],
-        "monitoring": "Report urticaria or throat swelling immediately — may indicate allergy",
-        "storage": "Room temperature (tablets/capsules); refrigerate oral suspension",
-    },
-    "omeprazole": {
-        "generic": "Omeprazole",
-        "drug_class": "Proton Pump Inhibitor — Antacid",
-        "dosage": "20–40 mg once daily",
-        "timing": "30–60 minutes before breakfast for maximum effect",
-        "reminders": ["Before breakfast (07:30)"],
-        "side_effects": ["Headache", "Diarrhoea", "Vitamin B12 deficiency (long-term)"],
-        "monitoring": "Long-term use: check magnesium, B12, and bone density annually",
-        "storage": "Room temperature",
-    },
-    "ibuprofen": {
-        "generic": "Ibuprofen",
-        "drug_class": "NSAID — Analgesic / Anti-inflammatory",
-        "dosage": "200–800 mg every 6–8 h (max 3200 mg/day)",
-        "timing": "Always take with food or milk to reduce gastric irritation",
-        "reminders": ["With meals as needed — do not exceed recommended daily dose"],
-        "side_effects": ["GI irritation / ulceration", "Fluid retention", "Raised blood pressure"],
-        "monitoring": "Renal function with prolonged use; avoid in heart failure or CKD",
-        "storage": "Room temperature",
-    },
-    "amlodipine": {
-        "generic": "Amlodipine besylate",
-        "drug_class": "Calcium Channel Blocker — Antihypertensive",
-        "dosage": "5–10 mg once daily",
-        "timing": "Same time each day; morning or evening",
-        "reminders": ["Morning (08:00)"],
-        "side_effects": ["Peripheral oedema", "Flushing", "Headache"],
-        "monitoring": "Blood pressure and heart rate at each visit",
-        "storage": "Room temperature",
-    },
-    "levothyroxine": {
-        "generic": "Levothyroxine sodium",
-        "drug_class": "Thyroid Hormone Replacement",
-        "dosage": "25–200 mcg once daily (dose titrated by TSH)",
-        "timing": "30–60 minutes before breakfast on an empty stomach — calcium/iron supplements reduce absorption",
-        "reminders": ["Before breakfast on an empty stomach (07:00)"],
-        "side_effects": ["Palpitations (if over-replaced)", "Insomnia", "Weight loss"],
-        "monitoring": "TSH every 6–8 weeks until stable; then annually",
-        "storage": "Room temperature, protect from light and moisture",
-    },
-}
+
+async def _rxcui(drug: str) -> str | None:
+    """Resolve a drug name to its RxNorm CUI."""
+    try:
+        data = await _get(f"{RXNORM_BASE}/rxcui.json", {"name": drug, "search": 1})
+        ids = data.get("idGroup", {}).get("rxnormId") or []
+        return ids[0] if ids else None
+    except Exception:
+        return None
+
 
 # ── Tool 1: Drug Interactions ──────────────────────────────────────────────────
 
 @mcp.tool()
-def check_drug_interactions(
+async def check_drug_interactions(
     drugs: Annotated[
         list[str],
         Field(min_length=2, description="Two or more drug names to check for interactions"),
     ]
 ) -> str:
     """
-    Check for dangerous or clinically significant interactions between two or more medications.
-    Uses synthetic reference data only — not for real clinical decisions.
+    Check for drug interactions using the RxNorm Drug Interaction API.
+    Resolves each name to a standard RxCUI, then queries the live interaction database.
     """
-    normalised = [d.lower().strip() for d in drugs]
-    interactions_found: list[str] = []
+    rxcuis = dict(zip(drugs, await asyncio.gather(*[_rxcui(d) for d in drugs])))
+    resolved = {d: cid for d, cid in rxcuis.items() if cid}
+    unresolved = [d for d, cid in rxcuis.items() if not cid]
 
-    for i in range(len(normalised)):
-        for j in range(i + 1, len(normalised)):
-            pair = frozenset([normalised[i], normalised[j]])
-            if pair in DRUG_INTERACTIONS:
-                info = DRUG_INTERACTIONS[pair]
-                interactions_found.append(
-                    f"  ⚠️  {drugs[i].title()} + {drugs[j].title()}\n"
-                    f"     Severity     : {info['severity']}\n"
-                    f"     Effect       : {info['effect']}\n"
-                    f"     Recommend    : {info['recommendation']}"
-                )
-
-    pair_count = len(normalised) * (len(normalised) - 1) // 2
-    header = [
+    lines = [
         "╔══════════════════════════════════════════════════╗",
         "║        NEUROPHRAX — DRUG INTERACTION CHECK       ║",
         "╚══════════════════════════════════════════════════╝",
         f"  Drugs    : {', '.join(d.title() for d in drugs)}",
-        f"  Pairs    : {pair_count} checked",
+        f"  Source   : RxNorm Drug Interaction API",
         "",
     ]
 
-    if interactions_found:
-        body = [f"  🚨 {len(interactions_found)} INTERACTION(S) DETECTED:", ""] + interactions_found
+    if unresolved:
+        lines.append(f"  ⚠️  Could not resolve to RxCUI: {', '.join(unresolved)}")
+        lines.append("")
+
+    if len(resolved) < 2:
+        lines.append("  ❌ Need at least 2 resolved drugs to check interactions.")
+        return "\n".join(lines)
+
+    try:
+        data = await _get(
+            f"{RXNORM_BASE}/interaction/list.json",
+            {"rxcuis": " ".join(resolved.values())},
+        )
+    except Exception as e:
+        lines.append(f"  ❌ RxNorm API error: {e}")
+        return "\n".join(lines)
+
+    interactions = []
+    for group in data.get("fullInteractionTypeGroup", []):
+        source = group.get("sourceName", "Unknown")
+        for itype in group.get("fullInteractionType", []):
+            for pair in itype.get("interactionPair", []):
+                severity = pair.get("severity", "N/A").upper()
+                description = pair.get("description", "")
+                drug_names = " + ".join(
+                    ic.get("minConceptItem", {}).get("name", "")
+                    for ic in pair.get("interactionConcept", [])
+                )
+                interactions.append((severity, drug_names or "—", description, source))
+
+    if interactions:
+        lines.append(f"  🚨 {len(interactions)} INTERACTION(S) DETECTED:")
+        lines.append("")
+        for severity, names, desc, source in interactions:
+            emoji = "🔴" if severity in ("HIGH", "N/A") else "🟡"
+            lines += [
+                f"  {emoji} {names}",
+                f"     Severity  : {severity}",
+                f"     Detail    : {desc[:400]}",
+                f"     Source    : {source}",
+                "",
+            ]
     else:
-        body = [
-            "  ✅ No known interactions found in the synthetic database.",
+        lines += [
+            "  ✅ No known interactions found in the RxNorm database.",
             "     Always verify with a licensed pharmacist or prescriber.",
+            "",
         ]
 
-    footer = [
-        "",
-        "  ⚕️  DISCLAIMER: Synthetic/educational data only. Not for clinical use.",
-    ]
-    return "\n".join(header + body + footer)
+    lines.append("  ⚕️  DISCLAIMER: For informational use only. Not for clinical decisions.")
+    return "\n".join(lines)
 
 
-# ── Tool 2: Patient Summary ────────────────────────────────────────────────────
+# ── Tool 2: Medication Advice ──────────────────────────────────────────────────
 
 @mcp.tool()
-def generate_patient_summary(
+async def get_medication_advice(
+    medication: Annotated[str, Field(description="Drug name to look up")],
+) -> str:
+    """
+    Fetch dosage, warnings, adverse reactions, and drug interaction info
+    from the OpenFDA drug label database. Tries generic name first, then brand name.
+    """
+    label = None
+    for field in ("openfda.generic_name", "openfda.brand_name"):
+        try:
+            data = await _get(
+                f"{OPENFDA_BASE}/label.json",
+                {"search": f'{field}:"{medication}"', "limit": 1},
+            )
+            results = data.get("results", [])
+            if results:
+                label = results[0]
+                break
+        except httpx.HTTPStatusError:
+            continue
+
+    if not label:
+        return "\n".join([
+            f"  ❌ '{medication}' not found in OpenFDA drug label database.",
+            "",
+            "  ⚕️  DISCLAIMER: For informational use only. Not for clinical decisions.",
+        ])
+
+    openfda = label.get("openfda", {})
+
+    def first(key: str, default: str = "Not available") -> str:
+        val = label.get(key, [])
+        if not val:
+            return default
+        text = val[0].strip()
+        return text[:600] + "…" if len(text) > 600 else text
+
+    generic = ", ".join(openfda.get("generic_name", [medication.title()]))
+    brand = ", ".join(openfda.get("brand_name", ["—"]))
+    drug_class = ", ".join(openfda.get("pharm_class_epc", ["—"]))
+
+    return "\n".join([
+        "╔══════════════════════════════════════════════════╗",
+        "║         NEUROPHRAX — MEDICATION ADVICE           ║",
+        "╚══════════════════════════════════════════════════╝",
+        f"  Generic      : {generic}",
+        f"  Brand        : {brand}",
+        f"  Class        : {drug_class}",
+        f"  Source       : OpenFDA Drug Label",
+        "",
+        f"  DOSAGE       : {first('dosage_and_administration')}",
+        "",
+        f"  WARNINGS     : {first('warnings')}",
+        "",
+        f"  ADVERSE RX   : {first('adverse_reactions')}",
+        "",
+        f"  INTERACTIONS : {first('drug_interactions')}",
+        "",
+        "  ⚕️  DISCLAIMER: For informational use only. Not for clinical decisions.",
+    ])
+
+
+# ── Tool 3: Symptom → SNOMED CT Concepts ──────────────────────────────────────
+
+@mcp.tool()
+async def map_symptoms_to_conditions(
+    symptoms: Annotated[
+        list[str],
+        Field(min_length=1, description="Symptoms to map to SNOMED CT clinical findings"),
+    ],
+) -> str:
+    """
+    Map symptoms to standardized SNOMED CT clinical concepts.
+    Returns the preferred term, concept ID, and semantic type for each match.
+    Searches within the Clinical Finding hierarchy (SCTID 404684003).
+    """
+
+    async def lookup(symptom: str) -> tuple[str, list[dict]]:
+        try:
+            data = await _get(
+                f"{SNOMED_BASE}/concepts",
+                {
+                    "term": symptom,
+                    "activeFilter": "true",
+                    "limit": 5,
+                    "ecl": "<<404684003",  # Clinical finding + all descendants
+                },
+            )
+            return symptom, data.get("items", [])
+        except Exception:
+            return symptom, []
+
+    results = await asyncio.gather(*[lookup(s) for s in symptoms])
+
+    lines = [
+        "╔══════════════════════════════════════════════════╗",
+        "║      NEUROPHRAX — SYMPTOM-TO-CONDITION MAP       ║",
+        "╚══════════════════════════════════════════════════╝",
+        f"  Symptoms : {', '.join(symptoms)}",
+        f"  Source   : SNOMED CT International (Snowstorm API)",
+        "",
+    ]
+
+    for symptom, items in results:
+        lines.append(f"  • {symptom.title()}")
+        if items:
+            for item in items:
+                pt = (item.get("pt") or {}).get("term") or (item.get("fsn") or {}).get("term", "—")
+                sctid = item.get("conceptId", "—")
+                fsn_term = (item.get("fsn") or {}).get("term", "")
+                semantic = fsn_term[fsn_term.rfind("(") + 1: fsn_term.rfind(")")] if "(" in fsn_term else ""
+                tag = f"  [{semantic}]" if semantic else ""
+                lines.append(f"      → {pt}{tag}  [SCTID: {sctid}]")
+        else:
+            lines.append("      No SNOMED CT concepts found.")
+        lines.append("")
+
+    lines.append("  ⚕️  DISCLAIMER: For informational use only. Not for clinical decisions.")
+    return "\n".join(lines)
+
+
+# ── Tool 4: Patient Summary ────────────────────────────────────────────────────
+
+@mcp.tool()
+async def generate_patient_summary(
     name: Annotated[str, Field(description="Patient's full name")],
     age: Annotated[int, Field(ge=0, le=130, description="Patient age in years")],
     conditions: Annotated[list[str], Field(description="Active diagnosed medical conditions")],
@@ -259,10 +255,9 @@ def generate_patient_summary(
     last_visit: Annotated[str, Field(description="Date of last clinical visit (YYYY-MM-DD)")] = "Not recorded",
 ) -> str:
     """
-    Generate a structured patient summary from provided synthetic patient data.
-    Risk level is automatically assessed based on age, conditions, and medication count.
+    Generate a structured patient summary with SNOMED CT condition validation
+    and RxNorm-based medication resolution. Risk level is auto-assessed.
     """
-    # Simple synthetic risk scoring
     risk = "LOW"
     risk_reasons: list[str] = []
     if age >= 65:
@@ -284,7 +279,31 @@ def generate_patient_summary(
     def fmt_list(items: list[str], empty: str) -> str:
         return ("\n" + " " * 20).join(f"• {x}" for x in items) if items else empty
 
-    return "\n".join([
+    async def snomed_lookup(term: str) -> str | None:
+        try:
+            data = await _get(
+                f"{SNOMED_BASE}/concepts",
+                {"term": term, "activeFilter": "true", "limit": 1, "ecl": "<<404684003"},
+            )
+            items = data.get("items", [])
+            if items:
+                pt = (items[0].get("pt") or {}).get("term", term)
+                sctid = items[0].get("conceptId", "")
+                return f"    {term} → {pt}  [SCTID: {sctid}]"
+        except Exception:
+            pass
+        return None
+
+    # Run SNOMED condition validation and RxNorm medication resolution concurrently
+    snomed_results, rxnorm_results = await asyncio.gather(
+        asyncio.gather(*[snomed_lookup(c) for c in conditions[:5]]),
+        asyncio.gather(*[_rxcui(m) for m in medications[:10]]),
+    )
+
+    snomed_notes = [r for r in snomed_results if r]
+    rxnorm_map = {m: cid for m, cid in zip(medications[:10], rxnorm_results) if cid}
+
+    lines = [
         "╔══════════════════════════════════════════════════╗",
         "║          NEUROPHRAX — PATIENT SUMMARY            ║",
         "╚══════════════════════════════════════════════════╝",
@@ -298,118 +317,22 @@ def generate_patient_summary(
         f"  MEDICATIONS [{len(medications)}]  : {fmt_list(medications, 'None recorded')}",
         "",
         f"  ALLERGIES        : {fmt_list(allergies, 'NKDA — No Known Drug Allergies')}",
-        "",
-        "  ⚕️  DISCLAIMER: Synthetic/educational data only. Not for clinical use.",
-    ])
-
-
-# ── Tool 3: Symptoms → Conditions ─────────────────────────────────────────────
-
-@mcp.tool()
-def map_symptoms_to_conditions(
-    symptoms: Annotated[
-        list[str],
-        Field(min_length=1, description="Symptoms the patient is experiencing"),
-    ]
-) -> str:
-    """
-    Map reported symptoms to possible medical conditions using a synthetic reference database.
-    Conditions are ranked by how many symptoms point to them.
-    """
-    matched: dict[str, list[str]] = {}
-    condition_votes: dict[str, int] = {}
-
-    for symptom in symptoms:
-        s = symptom.lower().strip()
-        for db_key, conditions in SYMPTOMS_TO_CONDITIONS.items():
-            if s == db_key or db_key in s or s in db_key:
-                matched[symptom] = conditions
-                for c in conditions:
-                    condition_votes[c] = condition_votes.get(c, 0) + 1
-                break
-
-    unrecognised = [s for s in symptoms if s not in matched]
-    ranked = sorted(condition_votes.items(), key=lambda x: x[1], reverse=True)
-
-    lines = [
-        "╔══════════════════════════════════════════════════╗",
-        "║      NEUROPHRAX — SYMPTOM-TO-CONDITION MAP       ║",
-        "╚══════════════════════════════════════════════════╝",
-        f"  Symptoms : {', '.join(symptoms)}",
-        "",
     ]
 
-    if ranked:
-        lines += ["  POSSIBLE CONDITIONS (ranked by symptom overlap):", ""]
-        for condition, votes in ranked[:10]:
-            tag = "⚠️ " if "⚠️" in condition else "   "
-            lines.append(f"  {tag}{condition:<45}  [{votes} symptom(s)]")
-        lines.append("")
-        lines += ["  SYMPTOM BREAKDOWN:", ""]
-        for orig_symptom, conds in matched.items():
-            lines.append(f"    • {orig_symptom.title()}")
-            for c in conds[:4]:
-                lines.append(f"        → {c}")
-    else:
-        lines.append("  No recognised symptoms found in the synthetic database.")
+    if snomed_notes:
+        lines += ["", "  SNOMED CT CONDITION LOOKUP:", ""]
+        lines += snomed_notes
 
-    if unrecognised:
-        lines += ["", f"  Unrecognised: {', '.join(unrecognised)}"]
+    if rxnorm_map:
+        lines += ["", "  RXNORM MEDICATION IDs:", ""]
+        for med, cid in rxnorm_map.items():
+            lines.append(f"    {med.title()} → RxCUI {cid}")
 
     lines += [
         "",
-        "  ⚠️  Items marked ⚠️ may indicate emergencies — seek immediate care.",
-        "  ⚕️  DISCLAIMER: Synthetic/educational data only. Not for clinical use.",
+        "  ⚕️  DISCLAIMER: For informational use only. Not for clinical decisions.",
     ]
     return "\n".join(lines)
-
-
-# ── Tool 4: Medication Advice ──────────────────────────────────────────────────
-
-@mcp.tool()
-def get_medication_advice(
-    medication: Annotated[str, Field(description="Name of the medication to look up")]
-) -> str:
-    """
-    Return dosage, timing, reminder schedule, side effects, and monitoring info
-    for a given medication using synthetic reference data.
-    """
-    key = medication.lower().strip()
-    info = MEDICATIONS.get(key)
-
-    if not info:
-        available = ", ".join(m.title() for m in sorted(MEDICATIONS))
-        return "\n".join([
-            f"  ❌ '{medication}' not found in the synthetic database.",
-            "",
-            f"  Available medications: {available}",
-            "",
-            "  ⚕️  DISCLAIMER: Synthetic/educational data only. Not for clinical use.",
-        ])
-
-    reminders_fmt = "\n     ".join(f"🔔 {r}" for r in info["reminders"])
-    side_effects_fmt = " | ".join(info["side_effects"])
-
-    return "\n".join([
-        "╔══════════════════════════════════════════════════╗",
-        "║         NEUROPHRAX — MEDICATION ADVICE           ║",
-        "╚══════════════════════════════════════════════════╝",
-        f"  Medication   : {medication.title()}",
-        f"  Generic      : {info['generic']}",
-        f"  Class        : {info['drug_class']}",
-        "",
-        f"  DOSAGE       : {info['dosage']}",
-        f"  TIMING       : {info['timing']}",
-        "",
-        "  REMINDERS    :",
-        f"     {reminders_fmt}",
-        "",
-        f"  SIDE EFFECTS : {side_effects_fmt}",
-        f"  MONITORING   : {info['monitoring']}",
-        f"  STORAGE      : {info['storage']}",
-        "",
-        "  ⚕️  DISCLAIMER: Synthetic/educational data only. Not for clinical use.",
-    ])
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
