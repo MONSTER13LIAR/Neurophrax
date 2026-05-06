@@ -1,0 +1,82 @@
+# Python bytecode and packaging
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets.json
+secrets.yaml
+credentials.json
+credentials.yaml
+.credentials/
+.secrets/
+api_keys.txt
+*_secret*
+*.secret
+
+# Patient data — NEVER commit real PHI to this repo.
+# Synthetic test fixtures live in tests/ or fixtures/ explicitly.
+patient_data/
+real_patients/
+phi/
+*.phi
+*_real.json
+*_real.csv
+
+# Python tool caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.pyre/
+.pytype/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.hypothesis/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Logs and runtime junk
+*.log
+*.pid
+*.seed
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors / IDEs
+.vscode/
+.idea/
+.fleet/
+.zed/
+*.swp
+*.swo
+*.swn
+*~
+.#*
+
+# Project-specific — raw upstream downloads (rebuildable via scripts/build_db.py)
+scripts/raw/

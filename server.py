@@ -1,249 +1,300 @@
+"""Neurophrax — Healthcare data layer for AI agents.
+
+Tools synthesize live data from NIH RxNorm, FDA OpenFDA, and SNOMED CT
+(Snowstorm) into structured responses suitable for agent reasoning. Each
+tool returns both a human-readable `summary` and machine-readable `data`
+plus explicit source attribution. Educational use only.
 """
-Neurophrax MCP Server
-Live medical data from OpenFDA, RxNorm, and SNOMED CT APIs.
-"""
+from __future__ import annotations
 
 import asyncio
-import httpx
-from typing import Annotated
-from pydantic import Field
+from datetime import datetime, timezone
+from typing import Annotated, Any
+
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
+
+from sources import clinical_tables, interactions, openfda, rxnorm
 
 mcp = FastMCP(
     "Neurophrax",
     instructions=(
-        "Healthcare assistant backed by live OpenFDA, RxNorm, and SNOMED CT data. "
-        "For educational and informational use only — not for clinical decisions."
+        "Healthcare data layer backed by NIH RxNorm, FDA OpenFDA, and SNOMED CT. "
+        "Tools return both a human-readable summary and structured data with "
+        "explicit source attribution. Educational use only — not for clinical decisions."
     ),
 )
 
-RXNORM_BASE = "https://rxnav.nlm.nih.gov/REST"
-OPENFDA_BASE = "https://api.fda.gov/drug"
-SNOMED_BASE = "https://browser.ihtsdotools.org/snowstorm/snomed-ct/MAIN"
-TIMEOUT = 15.0
+DISCLAIMER = "For informational use only. Not for clinical decisions."
 
 
-async def _get(url: str, params: dict | None = None) -> dict:
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        return r.json()
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-async def _rxcui(drug: str) -> str | None:
-    """Resolve a drug name to its RxNorm CUI."""
-    try:
-        data = await _get(f"{RXNORM_BASE}/rxcui.json", {"name": drug, "search": 1})
-        ids = data.get("idGroup", {}).get("rxnormId") or []
-        return ids[0] if ids else None
-    except Exception:
-        return None
+def _response(
+    *,
+    summary: str,
+    data: dict[str, Any],
+    sources: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "summary": summary,
+        "data": data,
+        "sources": sources,
+        "disclaimer": DISCLAIMER,
+    }
 
 
-# ── Tool 1: Drug Interactions ──────────────────────────────────────────────────
+# ── Tool 1: Drug Interactions ───────────────────────────────────────────────
+
+_SEVERITY_EMOJI = {
+    "MAJOR": "🔴",
+    "MODERATE": "🟡",
+    "MINOR": "🟢",
+    "UNKNOWN": "⚪",
+}
+
 
 @mcp.tool()
 async def check_drug_interactions(
     drugs: Annotated[
         list[str],
         Field(min_length=2, description="Two or more drug names to check for interactions"),
+    ],
+) -> dict[str, Any]:
+    """Check for drug-drug interactions across every unique pair.
+
+    Primary source: bundled DDInter 2.0 dataset (severity-rated, ~160k pairs).
+    Fallback: parses the OpenFDA drug label `drug_interactions` section for
+    pairs not in DDInter. RxNorm RxCUIs are resolved in parallel for downstream
+    use by agents.
+    """
+    rxcui_results = await asyncio.gather(*[rxnorm.name_to_rxcui(d) for d in drugs])
+    found, counts = await interactions.check_pairs(drugs, rxcui_results)
+
+    rxcuis = dict(zip(drugs, rxcui_results))
+    resolved = {d: c for d, c in rxcuis.items() if c}
+    unresolved = [d for d, c in rxcuis.items() if not c]
+    ddinter_version = interactions.dataset_version()
+
+    sources_meta: list[dict[str, Any]] = [
+        {"name": "RxNorm", "url": rxnorm.BASE, "accessed_at": _now()},
+        {
+            "name": "DDInter 2.0",
+            "url": interactions.DDINTER_HOME,
+            "version": ddinter_version or "not ingested",
+            "accessed_at": _now(),
+        },
     ]
-) -> str:
-    """
-    Check for drug interactions using the RxNorm Drug Interaction API.
-    Resolves each name to a standard RxCUI, then queries the live interaction database.
-    """
-    rxcuis = dict(zip(drugs, await asyncio.gather(*[_rxcui(d) for d in drugs])))
-    resolved = {d: cid for d, cid in rxcuis.items() if cid}
-    unresolved = [d for d, cid in rxcuis.items() if not cid]
+    if counts.get("openfda_label", 0):
+        sources_meta.append(
+            {"name": "OpenFDA Drug Label", "url": openfda.BASE, "accessed_at": _now()}
+        )
 
     lines = [
         "╔══════════════════════════════════════════════════╗",
         "║        NEUROPHRAX — DRUG INTERACTION CHECK       ║",
         "╚══════════════════════════════════════════════════╝",
         f"  Drugs    : {', '.join(d.title() for d in drugs)}",
-        f"  Source   : RxNorm Drug Interaction API",
+        f"  Sources  : DDInter {ddinter_version or '(not ingested)'} + OpenFDA labels (fallback)",
         "",
     ]
-
     if unresolved:
-        lines.append(f"  ⚠️  Could not resolve to RxCUI: {', '.join(unresolved)}")
-        lines.append("")
+        lines += [f"  ⚠️  Could not resolve to RxCUI: {', '.join(unresolved)}", ""]
 
-    if len(resolved) < 2:
-        lines.append("  ❌ Need at least 2 resolved drugs to check interactions.")
-        return "\n".join(lines)
-
-    try:
-        data = await _get(
-            f"{RXNORM_BASE}/interaction/list.json",
-            {"rxcuis": " ".join(resolved.values())},
+    if found:
+        lines.append(f"  🚨 {len(found)} INTERACTION(S) DETECTED:")
+        lines.append(
+            f"     ({counts['ddinter']} from DDInter, "
+            f"{counts['openfda_label']} from OpenFDA labels)"
         )
-    except Exception as e:
-        lines.append(f"  ❌ RxNorm API error: {e}")
-        return "\n".join(lines)
-
-    interactions = []
-    for group in data.get("fullInteractionTypeGroup", []):
-        source = group.get("sourceName", "Unknown")
-        for itype in group.get("fullInteractionType", []):
-            for pair in itype.get("interactionPair", []):
-                severity = pair.get("severity", "N/A").upper()
-                description = pair.get("description", "")
-                drug_names = " + ".join(
-                    ic.get("minConceptItem", {}).get("name", "")
-                    for ic in pair.get("interactionConcept", [])
-                )
-                interactions.append((severity, drug_names or "—", description, source))
-
-    if interactions:
-        lines.append(f"  🚨 {len(interactions)} INTERACTION(S) DETECTED:")
         lines.append("")
-        for severity, names, desc, source in interactions:
-            emoji = "🔴" if severity in ("HIGH", "N/A") else "🟡"
+        for inter in found:
+            severity = (inter["severity"] or "Unknown").upper()
+            emoji = _SEVERITY_EMOJI.get(severity, "⚪")
+            names = f"{inter['drug_a']} + {inter['drug_b']}"
             lines += [
                 f"  {emoji} {names}",
-                f"     Severity  : {severity}",
-                f"     Detail    : {desc[:400]}",
-                f"     Source    : {source}",
-                "",
+                f"     Severity : {severity.title()}",
+                f"     Source   : {inter['source']}",
             ]
+            if inter.get("description"):
+                lines.append(f"     Detail   : {inter['description'][:400]}")
+            lines.append("")
     else:
         lines += [
-            "  ✅ No known interactions found in the RxNorm database.",
+            "  ✅ No interactions found in DDInter or FDA label text.",
             "     Always verify with a licensed pharmacist or prescriber.",
             "",
         ]
 
-    lines.append("  ⚕️  DISCLAIMER: For informational use only. Not for clinical decisions.")
-    return "\n".join(lines)
+    lines.append(f"  ⚕️  DISCLAIMER: {DISCLAIMER}")
+
+    return _response(
+        summary="\n".join(lines),
+        data={
+            "queried_drugs": list(drugs),
+            "resolved_rxcuis": resolved,
+            "unresolved": unresolved,
+            "interactions": found,
+            "source_counts": counts,
+            "ddinter_version": ddinter_version,
+        },
+        sources=sources_meta,
+    )
 
 
-# ── Tool 2: Medication Advice ──────────────────────────────────────────────────
+# ── Tool 2: Medication Advice ───────────────────────────────────────────────
 
 @mcp.tool()
 async def get_medication_advice(
     medication: Annotated[str, Field(description="Drug name to look up")],
-) -> str:
+) -> dict[str, Any]:
+    """Fetch dosage, warnings, adverse reactions, and drug interaction info.
+
+    Sources the FDA OpenFDA drug label database. Tries generic name first,
+    then brand name.
     """
-    Fetch dosage, warnings, adverse reactions, and drug interaction info
-    from the OpenFDA drug label database. Tries generic name first, then brand name.
-    """
-    label = None
-    for field in ("openfda.generic_name", "openfda.brand_name"):
-        try:
-            data = await _get(
-                f"{OPENFDA_BASE}/label.json",
-                {"search": f'{field}:"{medication}"', "limit": 1},
-            )
-            results = data.get("results", [])
-            if results:
-                label = results[0]
-                break
-        except httpx.HTTPStatusError:
-            continue
+    label = await openfda.label_for(medication)
+    sources = [{"name": "OpenFDA Drug Label", "url": openfda.BASE, "accessed_at": _now()}]
 
     if not label:
-        return "\n".join([
-            f"  ❌ '{medication}' not found in OpenFDA drug label database.",
-            "",
-            "  ⚕️  DISCLAIMER: For informational use only. Not for clinical decisions.",
-        ])
+        return _response(
+            summary="\n".join([
+                f"  ❌ '{medication}' not found in OpenFDA drug label database.",
+                "",
+                f"  ⚕️  DISCLAIMER: {DISCLAIMER}",
+            ]),
+            data={"medication": medication, "found": False},
+            sources=sources,
+        )
 
-    openfda = label.get("openfda", {})
+    openfda_meta = label.get("openfda", {})
 
-    def first(key: str, default: str = "Not available") -> str:
+    def _first(key: str, default: str = "Not available") -> str:
         val = label.get(key, [])
         if not val:
             return default
         text = val[0].strip()
         return text[:600] + "…" if len(text) > 600 else text
 
-    generic = ", ".join(openfda.get("generic_name", [medication.title()]))
-    brand = ", ".join(openfda.get("brand_name", ["—"]))
-    drug_class = ", ".join(openfda.get("pharm_class_epc", ["—"]))
+    generic = openfda_meta.get("generic_name", [medication.title()])
+    brand = openfda_meta.get("brand_name", ["—"])
+    drug_class = openfda_meta.get("pharm_class_epc", ["—"])
 
-    return "\n".join([
+    summary = "\n".join([
         "╔══════════════════════════════════════════════════╗",
         "║         NEUROPHRAX — MEDICATION ADVICE           ║",
         "╚══════════════════════════════════════════════════╝",
-        f"  Generic      : {generic}",
-        f"  Brand        : {brand}",
-        f"  Class        : {drug_class}",
+        f"  Generic      : {', '.join(generic)}",
+        f"  Brand        : {', '.join(brand)}",
+        f"  Class        : {', '.join(drug_class)}",
         f"  Source       : OpenFDA Drug Label",
         "",
-        f"  DOSAGE       : {first('dosage_and_administration')}",
+        f"  DOSAGE       : {_first('dosage_and_administration')}",
         "",
-        f"  WARNINGS     : {first('warnings')}",
+        f"  WARNINGS     : {_first('warnings')}",
         "",
-        f"  ADVERSE RX   : {first('adverse_reactions')}",
+        f"  ADVERSE RX   : {_first('adverse_reactions')}",
         "",
-        f"  INTERACTIONS : {first('drug_interactions')}",
+        f"  INTERACTIONS : {_first('drug_interactions')}",
         "",
-        "  ⚕️  DISCLAIMER: For informational use only. Not for clinical decisions.",
+        f"  ⚕️  DISCLAIMER: {DISCLAIMER}",
     ])
 
+    return _response(
+        summary=summary,
+        data={
+            "medication": medication,
+            "found": True,
+            "generic_name": generic,
+            "brand_name": brand,
+            "pharm_class": drug_class,
+            "dosage_and_administration": _first("dosage_and_administration"),
+            "warnings": _first("warnings"),
+            "adverse_reactions": _first("adverse_reactions"),
+            "drug_interactions": _first("drug_interactions"),
+        },
+        sources=sources,
+    )
 
-# ── Tool 3: Symptom → SNOMED CT Concepts ──────────────────────────────────────
+
+# ── Tool 3: Symptom → Conditions + ICD-10-CM ────────────────────────────────
 
 @mcp.tool()
 async def map_symptoms_to_conditions(
     symptoms: Annotated[
         list[str],
-        Field(min_length=1, description="Symptoms to map to SNOMED CT clinical findings"),
+        Field(min_length=1, description="Symptoms or condition terms to map"),
     ],
-) -> str:
+) -> dict[str, Any]:
+    """Map symptoms to clinical conditions and ICD-10-CM diagnosis codes.
+
+    Returns two parallel views per symptom: a curated FHIR Conditions Value
+    Set match (with MedlinePlus consumer URL where available) and the
+    matching ICD-10-CM billable codes. Both come from the NIH Clinical
+    Tables Search Service.
     """
-    Map symptoms to standardized SNOMED CT clinical concepts.
-    Returns the preferred term, concept ID, and semantic type for each match.
-    Searches within the Clinical Finding hierarchy (SCTID 404684003).
-    """
+    tasks: list[Any] = []
+    for s in symptoms:
+        tasks.append(clinical_tables.search_conditions(s, limit=5))
+        tasks.append(clinical_tables.search_icd10(s, limit=5))
+    results = await asyncio.gather(*tasks)
 
-    async def lookup(symptom: str) -> tuple[str, list[dict]]:
-        try:
-            data = await _get(
-                f"{SNOMED_BASE}/concepts",
-                {
-                    "term": symptom,
-                    "activeFilter": "true",
-                    "limit": 5,
-                    "ecl": "<<404684003",  # Clinical finding + all descendants
-                },
-            )
-            return symptom, data.get("items", [])
-        except Exception:
-            return symptom, []
-
-    results = await asyncio.gather(*[lookup(s) for s in symptoms])
-
+    mapped: dict[str, dict[str, list[dict[str, Any]]]] = {}
     lines = [
         "╔══════════════════════════════════════════════════╗",
         "║      NEUROPHRAX — SYMPTOM-TO-CONDITION MAP       ║",
         "╚══════════════════════════════════════════════════╝",
         f"  Symptoms : {', '.join(symptoms)}",
-        f"  Source   : SNOMED CT International (Snowstorm API)",
+        f"  Sources  : NIH Clinical Tables (Conditions VS + ICD-10-CM)",
         "",
     ]
 
-    for symptom, items in results:
+    for i, symptom in enumerate(symptoms):
+        conds: list[dict[str, Any]] = results[i * 2] or []
+        icd10: list[dict[str, Any]] = results[i * 2 + 1] or []
+        mapped[symptom] = {"conditions": conds, "icd10": icd10}
+
         lines.append(f"  • {symptom.title()}")
-        if items:
-            for item in items:
-                pt = (item.get("pt") or {}).get("term") or (item.get("fsn") or {}).get("term", "—")
-                sctid = item.get("conceptId", "—")
-                fsn_term = (item.get("fsn") or {}).get("term", "")
-                semantic = fsn_term[fsn_term.rfind("(") + 1: fsn_term.rfind(")")] if "(" in fsn_term else ""
-                tag = f"  [{semantic}]" if semantic else ""
-                lines.append(f"      → {pt}{tag}  [SCTID: {sctid}]")
+        if conds:
+            lines.append("      Conditions:")
+            for c in conds:
+                lines.append(f"        → {c['name']}  (key {c['key_id']})")
+                if c.get("medlineplus_url"):
+                    lines.append(f"            MedlinePlus: {c['medlineplus_url']}")
         else:
-            lines.append("      No SNOMED CT concepts found.")
+            lines.append("      Conditions: (no curated match)")
+        if icd10:
+            lines.append("      ICD-10-CM:")
+            for code in icd10:
+                lines.append(f"        → {code['code']}  {code['name']}")
+        else:
+            lines.append("      ICD-10-CM: (no match)")
         lines.append("")
 
-    lines.append("  ⚕️  DISCLAIMER: For informational use only. Not for clinical decisions.")
-    return "\n".join(lines)
+    lines.append(f"  ⚕️  DISCLAIMER: {DISCLAIMER}")
+
+    return _response(
+        summary="\n".join(lines),
+        data={"mappings": mapped},
+        sources=[
+            {
+                "name": "NIH Clinical Tables — Conditions",
+                "url": f"{clinical_tables.BASE}/conditions/v3",
+                "accessed_at": _now(),
+            },
+            {
+                "name": "NIH Clinical Tables — ICD-10-CM",
+                "url": f"{clinical_tables.BASE}/icd10cm/v3",
+                "accessed_at": _now(),
+            },
+        ],
+    )
 
 
-# ── Tool 4: Patient Summary ────────────────────────────────────────────────────
+# ── Tool 4: Patient Summary ─────────────────────────────────────────────────
 
 @mcp.tool()
 async def generate_patient_summary(
@@ -252,11 +303,14 @@ async def generate_patient_summary(
     conditions: Annotated[list[str], Field(description="Active diagnosed medical conditions")],
     medications: Annotated[list[str], Field(description="Current medications")],
     allergies: Annotated[list[str], Field(description="Known drug/food allergies")],
-    last_visit: Annotated[str, Field(description="Date of last clinical visit (YYYY-MM-DD)")] = "Not recorded",
-) -> str:
-    """
-    Generate a structured patient summary with SNOMED CT condition validation
-    and RxNorm-based medication resolution. Risk level is auto-assessed.
+    last_visit: Annotated[
+        str, Field(description="Date of last clinical visit (YYYY-MM-DD)")
+    ] = "Not recorded",
+) -> dict[str, Any]:
+    """Generate a structured patient summary.
+
+    Validates conditions against SNOMED CT, resolves medications via RxNorm,
+    and computes a heuristic risk level.
     """
     risk = "LOW"
     risk_reasons: list[str] = []
@@ -276,32 +330,27 @@ async def generate_patient_summary(
             risk_reasons.append(f"critical condition: {c}")
             break
 
-    def fmt_list(items: list[str], empty: str) -> str:
-        return ("\n" + " " * 20).join(f"• {x}" for x in items) if items else empty
-
-    async def snomed_lookup(term: str) -> str | None:
-        try:
-            data = await _get(
-                f"{SNOMED_BASE}/concepts",
-                {"term": term, "activeFilter": "true", "limit": 1, "ecl": "<<404684003"},
-            )
-            items = data.get("items", [])
-            if items:
-                pt = (items[0].get("pt") or {}).get("term", term)
-                sctid = items[0].get("conceptId", "")
-                return f"    {term} → {pt}  [SCTID: {sctid}]"
-        except Exception:
-            pass
-        return None
-
-    # Run SNOMED condition validation and RxNorm medication resolution concurrently
-    snomed_results, rxnorm_results = await asyncio.gather(
-        asyncio.gather(*[snomed_lookup(c) for c in conditions[:5]]),
-        asyncio.gather(*[_rxcui(m) for m in medications[:10]]),
+    condition_results, rxnorm_results = await asyncio.gather(
+        asyncio.gather(
+            *[clinical_tables.search_conditions(c, limit=1) for c in conditions[:5]]
+        ),
+        asyncio.gather(*[rxnorm.name_to_rxcui(m) for m in medications[:10]]),
     )
 
-    snomed_notes = [r for r in snomed_results if r]
-    rxnorm_map = {m: cid for m, cid in zip(medications[:10], rxnorm_results) if cid}
+    condition_lookups: list[dict[str, Any]] = []
+    for cond, conds in zip(conditions[:5], condition_results):
+        if not conds:
+            continue
+        condition_lookups.append({
+            "condition": cond,
+            "matched_name": conds[0]["name"],
+            "medlineplus_url": conds[0].get("medlineplus_url"),
+        })
+
+    rxnorm_map = {m: c for m, c in zip(medications[:10], rxnorm_results) if c}
+
+    def _fmt_list(items: list[str], empty: str) -> str:
+        return ("\n" + " " * 20).join(f"• {x}" for x in items) if items else empty
 
     lines = [
         "╔══════════════════════════════════════════════════╗",
@@ -310,32 +359,50 @@ async def generate_patient_summary(
         f"  Name             : {name}",
         f"  Age              : {age} years old",
         f"  Last Visit       : {last_visit}",
-        f"  Risk Level       : {risk}" + (f"  ({'; '.join(risk_reasons)})" if risk_reasons else ""),
+        f"  Risk Level       : {risk}"
+        + (f"  ({'; '.join(risk_reasons)})" if risk_reasons else ""),
         "",
-        f"  CONDITIONS [{len(conditions)}]   : {fmt_list(conditions, 'None recorded')}",
+        f"  CONDITIONS [{len(conditions)}]   : {_fmt_list(conditions, 'None recorded')}",
         "",
-        f"  MEDICATIONS [{len(medications)}]  : {fmt_list(medications, 'None recorded')}",
+        f"  MEDICATIONS [{len(medications)}]  : {_fmt_list(medications, 'None recorded')}",
         "",
-        f"  ALLERGIES        : {fmt_list(allergies, 'NKDA — No Known Drug Allergies')}",
+        f"  ALLERGIES        : {_fmt_list(allergies, 'NKDA — No Known Drug Allergies')}",
     ]
-
-    if snomed_notes:
-        lines += ["", "  SNOMED CT CONDITION LOOKUP:", ""]
-        lines += snomed_notes
-
+    if condition_lookups:
+        lines += ["", "  CONDITION VALIDATION:", ""]
+        for entry in condition_lookups:
+            lines.append(f"    {entry['condition']} → {entry['matched_name']}")
+            if entry.get("medlineplus_url"):
+                lines.append(f"      MedlinePlus: {entry['medlineplus_url']}")
     if rxnorm_map:
         lines += ["", "  RXNORM MEDICATION IDs:", ""]
         for med, cid in rxnorm_map.items():
             lines.append(f"    {med.title()} → RxCUI {cid}")
+    lines += ["", f"  ⚕️  DISCLAIMER: {DISCLAIMER}"]
 
-    lines += [
-        "",
-        "  ⚕️  DISCLAIMER: For informational use only. Not for clinical decisions.",
-    ]
-    return "\n".join(lines)
+    return _response(
+        summary="\n".join(lines),
+        data={
+            "patient": {"name": name, "age": age, "last_visit": last_visit},
+            "conditions": conditions,
+            "medications": medications,
+            "allergies": allergies,
+            "risk": {"level": risk, "reasons": risk_reasons},
+            "condition_lookups": condition_lookups,
+            "rxnorm_map": rxnorm_map,
+        },
+        sources=[
+            {
+                "name": "NIH Clinical Tables — Conditions + ICD-10-CM",
+                "url": clinical_tables.BASE,
+                "accessed_at": _now(),
+            },
+            {"name": "RxNorm", "url": rxnorm.BASE, "accessed_at": _now()},
+        ],
+    )
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ── Entry point ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     mcp.run()
