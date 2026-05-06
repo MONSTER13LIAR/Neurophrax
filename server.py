@@ -14,7 +14,15 @@ from typing import Annotated, Any
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
-from sources import clinical_tables, interactions, openfda, rxnorm
+from sources import (
+    clinical_tables,
+    dailymed,
+    interactions,
+    medlineplus,
+    openfda,
+    rxclass,
+    rxnorm,
+)
 
 mcp = FastMCP(
     "Neurophrax",
@@ -147,51 +155,123 @@ async def check_drug_interactions(
 
 # ── Tool 2: Medication Advice ───────────────────────────────────────────────
 
+async def _empty_classes() -> dict[str, list[dict[str, Any]]]:
+    return {"atc": [], "epc": []}
+
+
+async def _empty_list() -> list[dict[str, Any]]:
+    return []
+
+
 @mcp.tool()
 async def get_medication_advice(
     medication: Annotated[str, Field(description="Drug name to look up")],
 ) -> dict[str, Any]:
-    """Fetch dosage, warnings, adverse reactions, and drug interaction info.
+    """Fetch comprehensive medication info synthesized from four NLM/FDA sources.
 
-    Sources the FDA OpenFDA drug label database. Tries generic name first,
-    then brand name.
+    - OpenFDA: parsed FDA label sections (dosage, warnings, adverse reactions,
+      interactions, boxed warning).
+    - DailyMed: links to manufacturer-specific SPLs with publication dates.
+    - RxClass: ATC and EPC therapeutic class memberships.
+    - MedlinePlus Connect: patient-friendly explanation in plain language.
     """
-    label = await openfda.label_for(medication)
-    sources = [{"name": "OpenFDA Drug Label", "url": openfda.BASE, "accessed_at": _now()}]
+    rxcui = await rxnorm.name_to_ingredient_rxcui(medication)
+    label, dailymed_results, classes, mp_entries = await asyncio.gather(
+        openfda.label_for(medication),
+        dailymed.search_spls(medication, limit=3),
+        rxclass.classes_for_rxcui(rxcui) if rxcui else _empty_classes(),
+        medlineplus.info_for(medlineplus.CS_RXNORM, rxcui) if rxcui else _empty_list(),
+    )
 
-    if not label:
+    sources = [
+        {"name": "RxNorm", "url": rxnorm.BASE, "accessed_at": _now()},
+        {"name": "OpenFDA Drug Label", "url": openfda.BASE, "accessed_at": _now()},
+        {"name": "DailyMed", "url": dailymed.BASE, "accessed_at": _now()},
+        {"name": "RxClass", "url": rxclass.BASE, "accessed_at": _now()},
+        {"name": "MedlinePlus Connect", "url": medlineplus.BASE, "accessed_at": _now()},
+    ]
+
+    if not label and not dailymed_results and not mp_entries:
         return _response(
             summary="\n".join([
-                f"  ❌ '{medication}' not found in OpenFDA drug label database.",
+                f"  ❌ '{medication}' not found across OpenFDA / DailyMed / MedlinePlus.",
                 "",
                 f"  ⚕️  DISCLAIMER: {DISCLAIMER}",
             ]),
-            data={"medication": medication, "found": False},
+            data={"medication": medication, "found": False, "rxcui": rxcui},
             sources=sources,
         )
 
-    openfda_meta = label.get("openfda", {})
+    openfda_meta = (label or {}).get("openfda") or {}
 
     def _first(key: str, default: str = "Not available") -> str:
-        val = label.get(key, [])
+        val = (label or {}).get(key) or []
         if not val:
             return default
-        text = val[0].strip()
+        text = (val[0] or "").strip()
         return text[:600] + "…" if len(text) > 600 else text
 
-    generic = openfda_meta.get("generic_name", [medication.title()])
-    brand = openfda_meta.get("brand_name", ["—"])
-    drug_class = openfda_meta.get("pharm_class_epc", ["—"])
+    generic = openfda_meta.get("generic_name") or [medication.title()]
+    brand = openfda_meta.get("brand_name") or ["—"]
+    pharm_class_epc = openfda_meta.get("pharm_class_epc") or []
+    boxed_warning = ((label or {}).get("boxed_warning") or [None])[0]
+    if boxed_warning:
+        boxed_warning = boxed_warning.strip()
+        if len(boxed_warning) > 600:
+            boxed_warning = boxed_warning[:600] + "…"
 
-    summary = "\n".join([
+    atc_classes = classes.get("atc", [])
+    epc_classes = classes.get("epc", [])
+    patient_info = mp_entries[0] if mp_entries else None
+
+    # RxClass returns combination-product memberships alongside the drug's own
+    # therapeutic class — prefer non-combo classes for the displayed summary.
+    def _non_combo(cs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [c for c in cs if "combination" not in (c.get("class_name") or "").lower()]
+
+    atc_display = _non_combo(atc_classes) or atc_classes
+    epc_display = _non_combo(epc_classes) or epc_classes
+
+    atc_str = (
+        ", ".join(f"{c['class_id']} — {c['class_name']}" for c in atc_display[:3])
+        if atc_display
+        else "—"
+    )
+    epc_label = (
+        ", ".join(c["class_name"] for c in epc_display[:3])
+        if epc_display
+        else (", ".join(pharm_class_epc) if pharm_class_epc else "—")
+    )
+
+    lines = [
         "╔══════════════════════════════════════════════════╗",
         "║         NEUROPHRAX — MEDICATION ADVICE           ║",
         "╚══════════════════════════════════════════════════╝",
+        f"  Medication   : {medication.title()}",
+        f"  RxCUI        : {rxcui or '—'}",
         f"  Generic      : {', '.join(generic)}",
         f"  Brand        : {', '.join(brand)}",
-        f"  Class        : {', '.join(drug_class)}",
-        f"  Source       : OpenFDA Drug Label",
+        f"  Class (ATC)  : {atc_str}",
+        f"  Class (EPC)  : {epc_label}",
+        f"  Sources      : OpenFDA + DailyMed + RxClass + MedlinePlus",
         "",
+    ]
+
+    if patient_info:
+        lines += [
+            "  📋 PATIENT EXPLANATION (MedlinePlus):",
+            f"     {patient_info['title']}",
+        ]
+        if patient_info.get("url"):
+            lines.append(f"     {patient_info['url']}")
+        if patient_info.get("summary"):
+            lines.append(f"     {patient_info['summary']}")
+        lines.append("")
+
+    if boxed_warning:
+        lines += ["  ⚠️  BOXED WARNING:", f"     {boxed_warning}", ""]
+
+    lines += [
         f"  DOSAGE       : {_first('dosage_and_administration')}",
         "",
         f"  WARNINGS     : {_first('warnings')}",
@@ -200,21 +280,39 @@ async def get_medication_advice(
         "",
         f"  INTERACTIONS : {_first('drug_interactions')}",
         "",
-        f"  ⚕️  DISCLAIMER: {DISCLAIMER}",
-    ])
+    ]
+
+    if dailymed_results:
+        lines.append("  📚 DAILYMED LABELS:")
+        for entry in dailymed_results:
+            title = (entry.get("title") or "")[:80]
+            lines.append(f"     • {title}")
+            if entry.get("published_date"):
+                lines.append(f"       Published: {entry['published_date']}")
+            if entry.get("url"):
+                lines.append(f"       {entry['url']}")
+        lines.append("")
+
+    lines.append(f"  ⚕️  DISCLAIMER: {DISCLAIMER}")
 
     return _response(
-        summary=summary,
+        summary="\n".join(lines),
         data={
             "medication": medication,
             "found": True,
+            "rxcui": rxcui,
             "generic_name": generic,
             "brand_name": brand,
-            "pharm_class": drug_class,
+            "pharm_class_epc": pharm_class_epc,
+            "atc_classes": atc_classes,
+            "epc_classes": epc_classes,
+            "patient_info": patient_info,
+            "boxed_warning": boxed_warning,
             "dosage_and_administration": _first("dosage_and_administration"),
             "warnings": _first("warnings"),
             "adverse_reactions": _first("adverse_reactions"),
             "drug_interactions": _first("drug_interactions"),
+            "dailymed_labels": dailymed_results,
         },
         sources=sources,
     )
