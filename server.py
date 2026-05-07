@@ -8,20 +8,35 @@ plus explicit source attribution. Educational use only.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
+from mcp.server.fastmcp import Context
+
 from sources import (
     clinical_tables,
+    clinicaltrials,
     dailymed,
     interactions,
     medlineplus,
     openfda,
+    pubmed,
     rxclass,
     rxnorm,
+    safety_review,
+    vaccines,
+)
+from sources.beers import ATTRIBUTION as BEERS_ATTRIBUTION, SOURCE_URL as BEERS_URL
+from sources.sharp import FhirClient, bundle_entries, get_fhir_context, resolve_patient_id
+from sources.vaccines import (
+    ATTRIBUTION as VACCINES_ATTRIBUTION,
+    SOURCE_URL as VACCINES_URL,
 )
 
 mcp = FastMCP(
@@ -31,7 +46,33 @@ mcp = FastMCP(
         "Tools return both a human-readable summary and structured data with "
         "explicit source attribution. Educational use only — not for clinical decisions."
     ),
+    stateless_http=True,
+    host="0.0.0.0",
 )
+
+# Advertise SHARP-on-MCP FHIR context capability — tells the host which FHIR
+# scopes this server can consume when the platform propagates patient context
+# via x-fhir-server-url / x-fhir-access-token headers.
+_original_get_capabilities = mcp._mcp_server.get_capabilities
+
+
+def _patched_get_capabilities(notification_options, experimental_capabilities):
+    caps = _original_get_capabilities(notification_options, experimental_capabilities)
+    caps.model_extra["extensions"] = {
+        "ai.promptopinion/fhir-context": {
+            "scopes": [
+                {"name": "patient/Patient.rs", "required": True},
+                {"name": "patient/Condition.rs"},
+                {"name": "patient/MedicationStatement.rs"},
+                {"name": "patient/AllergyIntolerance.rs"},
+                {"name": "patient/Observation.rs"},
+            ]
+        }
+    }
+    return caps
+
+
+mcp._mcp_server.get_capabilities = _patched_get_capabilities
 
 DISCLAIMER = "For informational use only. Not for clinical decisions."
 
@@ -500,7 +541,585 @@ async def generate_patient_summary(
     )
 
 
-# ── Entry point ─────────────────────────────────────────────────────────────
+# ── Tool 5: Medication Safety Review (composer) ─────────────────────────────
 
-if __name__ == "__main__":
-    mcp.run()
+_SEVERITY_BANNER = {
+    "MAJOR": "🔴",
+    "AVOID": "🔴",
+    "AVOID_CHRONIC_USE": "🟠",
+    "USE_WITH_CAUTION": "🟡",
+    "MODERATE": "🟡",
+    "DOSE_ADJUST": "🟢",
+    "MINOR": "🟢",
+    "UNKNOWN": "⚪",
+}
+
+
+@mcp.tool()
+async def medication_safety_review(
+    medications: Annotated[
+        list[str] | None,
+        Field(description="Medications to review. Omit if SHARP/FHIR patient context is set."),
+    ] = None,
+    age: Annotated[
+        int | None,
+        Field(ge=0, le=130, description="Patient age. Omit if SHARP/FHIR patient context is set."),
+    ] = None,
+    conditions: Annotated[
+        list[str] | None,
+        Field(description="Active conditions (optional, used for pregnancy detection)."),
+    ] = None,
+    pregnant: Annotated[
+        bool, Field(description="Whether the patient is pregnant or planning to be.")
+    ] = False,
+    patientId: Annotated[  # noqa: N803
+        str | None,
+        Field(description="Explicit FHIR Patient ID. Auto-resolved from SHARP context if omitted."),
+    ] = None,
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """Composite medication safety review.
+
+    Cross-references four independent risk signals against patient context:
+
+    1. **Pairwise drug-drug interactions** (DDInter 2.0 + OpenFDA fallback).
+    2. **AGS Beers Criteria 2023** flags for adults ≥ 65 (and per-rule thresholds).
+    3. **Duplicate therapeutic class** detection via RxClass ATC.
+    4. **FDA boxed warnings** parsed from current drug labels (and pregnancy
+       contraindications when ``pregnant=True``).
+
+    When the request carries SHARP-on-MCP headers (``x-fhir-server-url`` /
+    ``x-fhir-access-token`` / ``x-patient-id``), the tool fetches the patient,
+    active medications, and active conditions from the FHIR server directly —
+    no need to pass them in. Otherwise it falls back to the explicit args.
+
+    Returns a single prioritized risk list, with each finding tagged by
+    severity, rationale, and recommended mitigation. Output includes a FHIR
+    ``RiskAssessment`` resource ready to persist back to the patient's record.
+    """
+    fhir_ctx = get_fhir_context(ctx)
+    resolved_pid = resolve_patient_id(ctx, patientId)
+    patient_facts: safety_review.PatientFacts | None = None
+    fhir_error: str | None = None
+
+    if fhir_ctx and resolved_pid:
+        try:
+            client = FhirClient(fhir_ctx)
+            patient_facts = await safety_review.patient_facts_from_fhir(client, resolved_pid)
+        except Exception as exc:  # graceful fallback to direct args
+            fhir_error = f"FHIR fetch failed: {exc}"
+            patient_facts = None
+
+    if patient_facts is None:
+        if not medications or age is None:
+            raise ValueError(
+                "medications and age are required when SHARP/FHIR patient context is not provided"
+            )
+        patient_facts = safety_review.PatientFacts(
+            age=age,
+            medications=list(medications),
+            conditions=list(conditions or []),
+            pregnant=pregnant,
+            patient_id=resolved_pid,
+            source="direct",
+        )
+
+    review = await safety_review.run(patient_facts)
+    findings = review.findings
+
+    sources_meta: list[dict[str, Any]] = [
+        {"name": "RxNorm", "url": rxnorm.BASE, "accessed_at": _now()},
+        {"name": "RxClass (ATC/EPC)", "url": rxclass.BASE, "accessed_at": _now()},
+        {"name": "OpenFDA Drug Label", "url": openfda.BASE, "accessed_at": _now()},
+        {
+            "name": "DDInter 2.0",
+            "url": interactions.DDINTER_HOME,
+            "version": interactions.dataset_version() or "not ingested",
+            "accessed_at": _now(),
+        },
+        {
+            "name": "AGS Beers Criteria 2023",
+            "url": BEERS_URL,
+            "attribution": BEERS_ATTRIBUTION,
+            "accessed_at": _now(),
+        },
+    ]
+    if patient_facts.source == "fhir":
+        sources_meta.insert(
+            0,
+            {
+                "name": "FHIR R4 Server",
+                "url": fhir_ctx.url if fhir_ctx else None,
+                "accessed_at": _now(),
+            },
+        )
+
+    # ── Human-readable summary ──
+    counts: dict[str, int] = {}
+    for f in findings:
+        counts[f.category] = counts.get(f.category, 0) + 1
+
+    lines = [
+        "╔══════════════════════════════════════════════════╗",
+        "║      NEUROPHRAX — MEDICATION SAFETY REVIEW       ║",
+        "╚══════════════════════════════════════════════════╝",
+        f"  Source       : {'FHIR R4 (SHARP context)' if patient_facts.source == 'fhir' else 'Direct input'}",
+        f"  Patient ID   : {patient_facts.patient_id or '—'}",
+        f"  Age          : {patient_facts.age} years",
+        f"  Medications  : {len(patient_facts.medications)}  ({', '.join(m.title() for m in patient_facts.medications) or '—'})",
+        f"  Conditions   : {len(patient_facts.conditions)}",
+        f"  Pregnant     : {'Yes' if patient_facts.pregnant else 'No'}",
+        "",
+        f"  ◇ {len(findings)} finding(s)"
+        + (f"   [interactions={counts.get('interaction', 0)}, beers={counts.get('beers', 0)}, "
+           f"duplicate_class={counts.get('duplicate_class', 0)}, boxed={counts.get('boxed_warning', 0)}, "
+           f"pregnancy={counts.get('pregnancy', 0)}]" if findings else ""),
+        "",
+    ]
+    if fhir_error:
+        lines += [f"  ⚠️  {fhir_error} — used direct args.", ""]
+
+    if not findings:
+        lines += [
+            "  ✅ No safety signals matched.",
+            "     Continue routine pharmacist review and monitoring.",
+        ]
+    else:
+        for f in findings:
+            emoji = _SEVERITY_BANNER.get(f.severity.upper(), "⚪")
+            lines += [
+                f"  {emoji} [{f.severity}] {f.outcome}",
+                f"     Why : {f.rationale[:300]}{'…' if len(f.rationale) > 300 else ''}",
+            ]
+            if f.mitigation:
+                lines.append(f"     Do  : {f.mitigation}")
+            lines.append("")
+
+    lines.append(f"  ⚕️  DISCLAIMER: {DISCLAIMER}")
+
+    return _response(
+        summary="\n".join(lines),
+        data={
+            "patient": {
+                "age": patient_facts.age,
+                "patient_id": patient_facts.patient_id,
+                "medications": patient_facts.medications,
+                "conditions": patient_facts.conditions,
+                "pregnant": patient_facts.pregnant,
+                "source": patient_facts.source,
+            },
+            "findings": [f.to_dict() for f in findings],
+            "fhir": {"RiskAssessment": review.fhir_resource},
+            "fhir_error": fhir_error,
+        },
+        sources=sources_meta,
+    )
+
+
+# ── Tool 6: Find Clinical Trials ────────────────────────────────────────────
+
+
+def _name_from_codeable(cc: dict[str, Any] | None) -> str | None:
+    if not cc:
+        return None
+    text = (cc.get("text") or "").strip()
+    if text:
+        return text
+    for c in cc.get("coding") or []:
+        disp = (c.get("display") or "").strip()
+        if disp:
+            return disp
+    return None
+
+
+@mcp.tool()
+async def find_clinical_trials(
+    condition: Annotated[
+        str | None,
+        Field(description="Condition to search. Omit if SHARP/FHIR patient context is set; conditions will be pulled from the chart."),
+    ] = None,
+    location: Annotated[
+        str | None, Field(description="City, state, or country to bias results by proximity.")
+    ] = None,
+    extra_term: Annotated[
+        str | None, Field(description="Additional free-text filter (e.g. specific intervention).")
+    ] = None,
+    include_not_yet_recruiting: Annotated[
+        bool, Field(description="Include studies not yet open to enrollment.")
+    ] = True,
+    limit: Annotated[
+        int, Field(ge=1, le=25, description="Maximum trials to return per condition.")
+    ] = 10,
+    patientId: Annotated[  # noqa: N803
+        str | None,
+        Field(description="Explicit FHIR Patient ID. Auto-resolved from SHARP context if omitted."),
+    ] = None,
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """Match a patient or free-text condition to actively recruiting clinical trials.
+
+    Uses ClinicalTrials.gov v2. When the request carries SHARP-on-MCP headers
+    and ``condition`` is omitted, the tool fetches the patient's active
+    ``Condition`` resources from the FHIR server and runs one search per
+    distinct condition. Results are projected to the protocol fields a
+    clinician typically scans: status, phase, eligibility summary,
+    interventions, and the top study locations.
+    """
+    fhir_ctx = get_fhir_context(ctx)
+    resolved_pid = resolve_patient_id(ctx, patientId)
+    conditions: list[str] = []
+    fhir_error: str | None = None
+
+    if condition:
+        conditions = [condition]
+    elif fhir_ctx and resolved_pid:
+        try:
+            client = FhirClient(fhir_ctx)
+            bundle = await client.search(
+                "Condition", {"patient": resolved_pid, "clinical-status": "active"}
+            )
+            for c in bundle_entries(bundle):
+                name = _name_from_codeable(c.get("code"))
+                if name:
+                    conditions.append(name)
+        except Exception as exc:
+            fhir_error = f"FHIR fetch failed: {exc}"
+    if not conditions:
+        raise ValueError(
+            "Provide a `condition` or call with SHARP/FHIR patient context that has active Condition resources."
+        )
+
+    statuses = clinicaltrials.RECRUITING_STATUSES
+    if not include_not_yet_recruiting:
+        statuses = ("RECRUITING",)
+
+    per_condition: list[dict[str, Any]] = []
+    total_studies = 0
+    for cond in conditions:
+        trials = await clinicaltrials.search_trials(
+            condition=cond,
+            location=location,
+            extra_term=extra_term,
+            statuses=statuses,
+            limit=limit,
+        )
+        total_studies += len(trials)
+        per_condition.append({"condition": cond, "trials": trials, "count": len(trials)})
+
+    lines = [
+        "╔══════════════════════════════════════════════════╗",
+        "║       NEUROPHRAX — CLINICAL TRIALS MATCH         ║",
+        "╚══════════════════════════════════════════════════╝",
+        f"  Source       : {'FHIR R4 (SHARP context)' if (fhir_ctx and resolved_pid and not condition) else 'Direct input'}",
+        f"  Conditions   : {', '.join(conditions)}",
+        f"  Location     : {location or '—'}",
+        f"  Total trials : {total_studies}",
+        "",
+    ]
+    if fhir_error:
+        lines += [f"  ⚠️  {fhir_error}", ""]
+    if total_studies == 0:
+        lines += ["  ✅ No matching trials in the requested status set.", ""]
+    for block in per_condition:
+        lines.append(f"  • {block['condition']}  ({block['count']} trial(s))")
+        for t in block["trials"]:
+            phase = t.get("phase") or t.get("study_type") or "—"
+            locs = t.get("locations") or []
+            loc_str = ", ".join(filter(None, [locs[0].get("city", ""), locs[0].get("country", "")])) if locs else "—"
+            lines += [
+                f"      → {t['nct_id']} — {t['title'][:80]}",
+                f"        Status: {t['status']}    Phase/Type: {phase}",
+                f"        First location: {loc_str}",
+                f"        URL: {t['url']}",
+            ]
+        lines.append("")
+
+    lines.append(f"  ⚕️  DISCLAIMER: {DISCLAIMER}")
+
+    return _response(
+        summary="\n".join(lines),
+        data={
+            "conditions": conditions,
+            "location": location,
+            "results": per_condition,
+            "total": total_studies,
+            "fhir_error": fhir_error,
+        },
+        sources=[
+            {"name": "ClinicalTrials.gov v2", "url": clinicaltrials.BASE, "accessed_at": _now()},
+        ],
+    )
+
+
+# ── Tool 7: Evidence Search (PubMed) ────────────────────────────────────────
+
+_VALID_STUDY_TYPES = tuple(pubmed.STUDY_TYPE_FILTERS.keys())
+
+
+@mcp.tool()
+async def search_evidence(
+    question: Annotated[
+        str, Field(description="Clinical question or topic (e.g. 'metformin in elderly CKD').")
+    ],
+    study_types: Annotated[
+        list[str] | None,
+        Field(
+            description=(
+                "Restrict to publication types: 'meta-analysis', 'systematic-review', "
+                "'rct', 'review', 'guideline', 'practice-guideline'. "
+                "Omit for unrestricted search."
+            )
+        ),
+    ] = None,
+    max_age_years: Annotated[
+        int, Field(ge=0, le=50, description="Restrict to articles published in the last N years (0 = no limit).")
+    ] = 5,
+    limit: Annotated[
+        int, Field(ge=1, le=30, description="Maximum citations to return.")
+    ] = 10,
+) -> dict[str, Any]:
+    """Search PubMed for clinically relevant evidence with built-in filters.
+
+    Composes the search with Humans + English filters and an optional study-
+    type restriction (meta-analyses, RCTs, systematic reviews, guidelines)
+    so callers consistently receive evidence-grade hits. Results are sorted
+    by publication date and projected to title, journal, year, authors, and
+    publication types — small enough for an agent to reason over.
+    """
+    valid_types = [s for s in (study_types or []) if s in pubmed.STUDY_TYPE_FILTERS]
+    invalid_types = sorted(set(study_types or []) - set(valid_types))
+    result = await pubmed.search(
+        question=question,
+        max_age_years=max_age_years if max_age_years > 0 else None,
+        study_types=valid_types or None,
+        limit=limit,
+    )
+    items = result["results"]
+
+    lines = [
+        "╔══════════════════════════════════════════════════╗",
+        "║         NEUROPHRAX — EVIDENCE SEARCH             ║",
+        "╚══════════════════════════════════════════════════╝",
+        f"  Question     : {question}",
+        f"  Filters      : {', '.join(valid_types) or 'none'}"
+        + (f"  (window: last {max_age_years}y)" if max_age_years else "  (no date window)"),
+        f"  Total hits   : {result['total']}    Returned: {len(items)}",
+        "",
+    ]
+    if invalid_types:
+        lines += [
+            f"  ⚠️  Unknown study_types ignored: {', '.join(invalid_types)}",
+            f"      Valid options: {', '.join(_VALID_STUDY_TYPES)}",
+            "",
+        ]
+    if not items:
+        lines += [
+            "  ✅ No matching articles for this composed query.",
+            "     Consider broadening study_types or extending max_age_years.",
+        ]
+    for r in items:
+        ptypes = ", ".join(r.get("publication_types") or []) or "—"
+        first_authors = ", ".join((r.get("authors") or [])[:3])
+        lines += [
+            f"  • PMID {r['pmid']} — {r['title'][:90]}",
+            f"      {r.get('journal') or '—'}    {r.get('pub_date') or '—'}",
+            f"      Authors: {first_authors or '—'}",
+            f"      Types  : {ptypes}",
+            f"      URL    : {r['url']}",
+            "",
+        ]
+
+    lines.append(f"  ⚕️  DISCLAIMER: {DISCLAIMER}")
+
+    return _response(
+        summary="\n".join(lines),
+        data={
+            "question": question,
+            "composed_query": result["query"],
+            "study_types": valid_types,
+            "max_age_years": max_age_years,
+            "total": result["total"],
+            "results": items,
+        },
+        sources=[
+            {"name": "NCBI PubMed (E-Utilities)", "url": pubmed.BASE, "accessed_at": _now()},
+        ],
+    )
+
+
+# ── Tool 8: Vaccine Recommendations (ACIP) ──────────────────────────────────
+
+
+_VACCINE_INDICATION_BANNER = {
+    vaccines.ROUTINE: "✅",
+    vaccines.RISK_BASED: "🟡",
+    vaccines.SHARED_DECISION: "🟦",
+}
+
+
+def _build_immunization_recommendation(
+    rules: list[Any], patient_id: str | None
+) -> dict[str, Any]:
+    """Emit a FHIR R4 ``ImmunizationRecommendation`` from matching ACIP rules."""
+    recs: list[dict[str, Any]] = []
+    for rule in rules:
+        recs.append(
+            {
+                "vaccineCode": [{"text": rule.name}],
+                "forecastStatus": {"text": rule.indication},
+                "dateCriterion": [],
+                "description": rule.rationale,
+                "supportingPatientInformation": [],
+            }
+        )
+    resource: dict[str, Any] = {
+        "resourceType": "ImmunizationRecommendation",
+        "date": _now(),
+        "recommendation": recs,
+    }
+    if patient_id:
+        resource["patient"] = {"reference": f"Patient/{patient_id}"}
+    return resource
+
+
+@mcp.tool()
+async def recommend_vaccines(
+    age: Annotated[
+        int | None,
+        Field(ge=0, le=130, description="Patient age. Omit if SHARP/FHIR patient context is set."),
+    ] = None,
+    conditions: Annotated[
+        list[str] | None,
+        Field(description="Active conditions used to enable risk-based vaccinations."),
+    ] = None,
+    pregnant: Annotated[
+        bool, Field(description="Whether the patient is currently pregnant.")
+    ] = False,
+    patientId: Annotated[  # noqa: N803
+        str | None,
+        Field(description="Explicit FHIR Patient ID. Auto-resolved from SHARP context if omitted."),
+    ] = None,
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """ACIP-curated adult vaccine recommendations based on age and chart conditions.
+
+    Returns the routine, risk-based, and shared-decision-making vaccines
+    that apply to the patient context. When SHARP/FHIR headers are present,
+    the tool pulls the patient's birthDate and active conditions directly
+    so the call can be made with no arguments at all. Output includes a FHIR
+    ``ImmunizationRecommendation`` resource.
+    """
+    fhir_ctx = get_fhir_context(ctx)
+    resolved_pid = resolve_patient_id(ctx, patientId)
+    fhir_error: str | None = None
+    source = "direct"
+
+    if (age is None) and fhir_ctx and resolved_pid:
+        try:
+            client = FhirClient(fhir_ctx)
+            facts = await safety_review.patient_facts_from_fhir(client, resolved_pid)
+            if facts is not None:
+                age = facts.age
+                conditions = list(facts.conditions)
+                pregnant = facts.pregnant
+                source = "fhir"
+        except Exception as exc:
+            fhir_error = f"FHIR fetch failed: {exc}"
+
+    if age is None:
+        raise ValueError(
+            "age is required when SHARP/FHIR patient context is not provided"
+        )
+
+    matches = vaccines.recommendations_for(
+        age=age, conditions=conditions or [], pregnant=pregnant
+    )
+    fhir_resource = _build_immunization_recommendation(matches, resolved_pid)
+
+    lines = [
+        "╔══════════════════════════════════════════════════╗",
+        "║         NEUROPHRAX — VACCINE RECOMMENDATIONS      ║",
+        "╚══════════════════════════════════════════════════╝",
+        f"  Source       : {'FHIR R4 (SHARP context)' if source == 'fhir' else 'Direct input'}",
+        f"  Patient ID   : {resolved_pid or '—'}",
+        f"  Age          : {age} years",
+        f"  Conditions   : {', '.join(conditions or []) or '—'}",
+        f"  Pregnant     : {'Yes' if pregnant else 'No'}",
+        f"  Sources      : CDC ACIP Adult Immunization Schedule",
+        "",
+    ]
+    if fhir_error:
+        lines += [f"  ⚠️  {fhir_error} — used direct args.", ""]
+    if not matches:
+        lines += [
+            "  ✅ No additional vaccines matched the supplied context.",
+            "     Always confirm against the live CDC ACIP schedule.",
+        ]
+    for rule in matches:
+        emoji = _VACCINE_INDICATION_BANNER.get(rule.indication, "▫")
+        lines += [
+            f"  {emoji} [{rule.indication}] {rule.name}",
+            f"     Why     : {rule.rationale}",
+            f"     Schedule: {rule.schedule}",
+            "",
+        ]
+
+    lines.append(f"  ⚕️  DISCLAIMER: {DISCLAIMER}")
+
+    return _response(
+        summary="\n".join(lines),
+        data={
+            "patient": {
+                "age": age,
+                "patient_id": resolved_pid,
+                "conditions": list(conditions or []),
+                "pregnant": pregnant,
+                "source": source,
+            },
+            "recommendations": [
+                {
+                    "rule_id": r.rule_id,
+                    "name": r.name,
+                    "indication": r.indication,
+                    "rationale": r.rationale,
+                    "schedule": r.schedule,
+                }
+                for r in matches
+            ],
+            "fhir": {"ImmunizationRecommendation": fhir_resource},
+            "fhir_error": fhir_error,
+        },
+        sources=[
+            {
+                "name": "CDC ACIP Adult Immunization Schedule",
+                "url": VACCINES_URL,
+                "attribution": VACCINES_ATTRIBUTION,
+                "accessed_at": _now(),
+            },
+        ],
+    )
+
+
+# ── HTTP transport (FastAPI + streamable HTTP at /mcp) ──────────────────────
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    async with mcp.session_manager.run():
+        yield
+
+
+app = FastAPI(lifespan=_lifespan, title="Neurophrax MCP")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.mount("/", mcp.streamable_http_app())
+
+
+if __name__ == "__main__":  # pragma: no cover
+    import uvicorn
+
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
