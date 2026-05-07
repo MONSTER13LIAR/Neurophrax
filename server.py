@@ -33,7 +33,13 @@ from sources import (
     vaccines,
 )
 from sources.beers import ATTRIBUTION as BEERS_ATTRIBUTION, SOURCE_URL as BEERS_URL
-from sources.sharp import FhirClient, bundle_entries, get_fhir_context, resolve_patient_id
+from sources.sharp import (
+    FhirClient,
+    bundle_entries,
+    chart_from_fhir,
+    get_fhir_context,
+    resolve_patient_id,
+)
 from sources.vaccines import (
     ATTRIBUTION as VACCINES_ATTRIBUTION,
     SOURCE_URL as VACCINES_URL,
@@ -108,9 +114,14 @@ _SEVERITY_EMOJI = {
 @mcp.tool()
 async def check_drug_interactions(
     drugs: Annotated[
-        list[str],
-        Field(min_length=2, description="Two or more drug names to check for interactions"),
-    ],
+        list[str] | None,
+        Field(description="Two or more drug names to check. Omit if SHARP/FHIR patient context is set."),
+    ] = None,
+    patientId: Annotated[  # noqa: N803
+        str | None,
+        Field(description="Explicit FHIR Patient ID. Auto-resolved from SHARP context if omitted."),
+    ] = None,
+    ctx: Context = None,
 ) -> dict[str, Any]:
     """Check for drug-drug interactions across every unique pair.
 
@@ -118,7 +129,31 @@ async def check_drug_interactions(
     Fallback: parses the OpenFDA drug label `drug_interactions` section for
     pairs not in DDInter. RxNorm RxCUIs are resolved in parallel for downstream
     use by agents.
+
+    When the request carries SHARP-on-MCP headers and ``drugs`` is omitted,
+    the tool fetches active ``MedicationStatement`` resources from the FHIR
+    server and runs the all-pair check on those.
     """
+    fhir_ctx = get_fhir_context(ctx)
+    resolved_pid = resolve_patient_id(ctx, patientId)
+    fhir_error: str | None = None
+    source = "direct"
+
+    if not drugs and fhir_ctx and resolved_pid:
+        try:
+            chart = await chart_from_fhir(FhirClient(fhir_ctx), resolved_pid)
+            if chart and chart.medications:
+                drugs = chart.medications
+                source = "fhir"
+        except Exception as exc:
+            fhir_error = f"FHIR fetch failed: {exc}"
+
+    if not drugs or len(drugs) < 2:
+        raise ValueError(
+            "Provide at least two drug names, or call with SHARP/FHIR patient context "
+            "that has at least two active MedicationStatement resources."
+        )
+
     rxcui_results = await asyncio.gather(*[rxnorm.name_to_rxcui(d) for d in drugs])
     found, counts = await interactions.check_pairs(drugs, rxcui_results)
 
@@ -145,10 +180,13 @@ async def check_drug_interactions(
         "╔══════════════════════════════════════════════════╗",
         "║        NEUROPHRAX — DRUG INTERACTION CHECK       ║",
         "╚══════════════════════════════════════════════════╝",
+        f"  Source   : {'FHIR R4 (SHARP context)' if source == 'fhir' else 'Direct input'}",
         f"  Drugs    : {', '.join(d.title() for d in drugs)}",
         f"  Sources  : DDInter {ddinter_version or '(not ingested)'} + OpenFDA labels (fallback)",
         "",
     ]
+    if fhir_error:
+        lines += [f"  ⚠️  {fhir_error} — used direct args.", ""]
     if unresolved:
         lines += [f"  ⚠️  Could not resolve to RxCUI: {', '.join(unresolved)}", ""]
 
@@ -189,6 +227,9 @@ async def check_drug_interactions(
             "interactions": found,
             "source_counts": counts,
             "ddinter_version": ddinter_version,
+            "patient_id": resolved_pid,
+            "source": source,
+            "fhir_error": fhir_error,
         },
         sources=sources_meta,
     )
@@ -437,20 +478,76 @@ async def map_symptoms_to_conditions(
 
 @mcp.tool()
 async def generate_patient_summary(
-    name: Annotated[str, Field(description="Patient's full name")],
-    age: Annotated[int, Field(ge=0, le=130, description="Patient age in years")],
-    conditions: Annotated[list[str], Field(description="Active diagnosed medical conditions")],
-    medications: Annotated[list[str], Field(description="Current medications")],
-    allergies: Annotated[list[str], Field(description="Known drug/food allergies")],
+    name: Annotated[
+        str | None, Field(description="Patient's full name. Omit if SHARP/FHIR context is set.")
+    ] = None,
+    age: Annotated[
+        int | None,
+        Field(ge=0, le=130, description="Patient age. Omit if SHARP/FHIR context is set."),
+    ] = None,
+    conditions: Annotated[
+        list[str] | None,
+        Field(description="Active diagnosed conditions. Pulled from FHIR if context is set."),
+    ] = None,
+    medications: Annotated[
+        list[str] | None,
+        Field(description="Current medications. Pulled from FHIR if context is set."),
+    ] = None,
+    allergies: Annotated[
+        list[str] | None,
+        Field(description="Known allergies. Pulled from FHIR if context is set."),
+    ] = None,
     last_visit: Annotated[
-        str, Field(description="Date of last clinical visit (YYYY-MM-DD)")
+        str, Field(description="Date of last clinical visit (YYYY-MM-DD).")
     ] = "Not recorded",
+    patientId: Annotated[  # noqa: N803
+        str | None,
+        Field(description="Explicit FHIR Patient ID. Auto-resolved from SHARP context if omitted."),
+    ] = None,
+    ctx: Context = None,
 ) -> dict[str, Any]:
     """Generate a structured patient summary.
 
-    Validates conditions against SNOMED CT, resolves medications via RxNorm,
-    and computes a heuristic risk level.
+    Validates conditions against the FHIR Conditions Value Set, resolves
+    medications via RxNorm, and computes a heuristic risk level.
+
+    When the request carries SHARP-on-MCP headers, any omitted argument is
+    pulled from the FHIR server (Patient → name + age, MedicationStatement,
+    Condition, AllergyIntolerance). Explicit args always win over chart data.
     """
+    fhir_ctx = get_fhir_context(ctx)
+    resolved_pid = resolve_patient_id(ctx, patientId)
+    fhir_error: str | None = None
+    chart_source = "direct"
+
+    if fhir_ctx and resolved_pid and (
+        name is None or age is None or conditions is None or medications is None or allergies is None
+    ):
+        try:
+            chart = await chart_from_fhir(FhirClient(fhir_ctx), resolved_pid)
+            if chart is not None:
+                chart_source = "fhir"
+                if name is None:
+                    name = chart.name
+                if age is None:
+                    age = chart.age
+                if conditions is None:
+                    conditions = list(chart.conditions)
+                if medications is None:
+                    medications = list(chart.medications)
+                if allergies is None:
+                    allergies = list(chart.allergies)
+        except Exception as exc:
+            fhir_error = f"FHIR fetch failed: {exc}"
+
+    if name is None or age is None:
+        raise ValueError(
+            "name and age are required when SHARP/FHIR patient context is not provided"
+        )
+    conditions = list(conditions or [])
+    medications = list(medications or [])
+    allergies = list(allergies or [])
+
     risk = "LOW"
     risk_reasons: list[str] = []
     if age >= 65:
@@ -495,6 +592,8 @@ async def generate_patient_summary(
         "╔══════════════════════════════════════════════════╗",
         "║          NEUROPHRAX — PATIENT SUMMARY            ║",
         "╚══════════════════════════════════════════════════╝",
+        f"  Source           : {'FHIR R4 (SHARP context)' if chart_source == 'fhir' else 'Direct input'}",
+        f"  Patient ID       : {resolved_pid or '—'}",
         f"  Name             : {name}",
         f"  Age              : {age} years old",
         f"  Last Visit       : {last_visit}",
@@ -507,6 +606,8 @@ async def generate_patient_summary(
         "",
         f"  ALLERGIES        : {_fmt_list(allergies, 'NKDA — No Known Drug Allergies')}",
     ]
+    if fhir_error:
+        lines += ["", f"  ⚠️  {fhir_error} — used direct args."]
     if condition_lookups:
         lines += ["", "  CONDITION VALIDATION:", ""]
         for entry in condition_lookups:
@@ -522,13 +623,20 @@ async def generate_patient_summary(
     return _response(
         summary="\n".join(lines),
         data={
-            "patient": {"name": name, "age": age, "last_visit": last_visit},
+            "patient": {
+                "name": name,
+                "age": age,
+                "last_visit": last_visit,
+                "patient_id": resolved_pid,
+                "source": chart_source,
+            },
             "conditions": conditions,
             "medications": medications,
             "allergies": allergies,
             "risk": {"level": risk, "reasons": risk_reasons},
             "condition_lookups": condition_lookups,
             "rxnorm_map": rxnorm_map,
+            "fhir_error": fhir_error,
         },
         sources=[
             {

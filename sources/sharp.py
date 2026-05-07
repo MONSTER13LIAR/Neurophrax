@@ -116,3 +116,128 @@ def bundle_entries(bundle: dict[str, Any] | None) -> list[dict[str, Any]]:
     if not bundle:
         return []
     return [e["resource"] for e in (bundle.get("entry") or []) if e.get("resource")]
+
+
+# ── Chart-level fetch (re-used by every patient-aware tool) ────────────────
+
+
+@dataclass(slots=True)
+class ChartFacts:
+    """Patient-chart projection used by every SHARP-aware tool."""
+
+    patient_id: str
+    name: str | None = None
+    age: int = 0
+    birth_date: str | None = None
+    medications: list[str] = None  # type: ignore[assignment]
+    conditions: list[str] = None  # type: ignore[assignment]
+    allergies: list[str] = None  # type: ignore[assignment]
+    pregnant: bool = False
+
+    def __post_init__(self) -> None:
+        if self.medications is None:
+            self.medications = []
+        if self.conditions is None:
+            self.conditions = []
+        if self.allergies is None:
+            self.allergies = []
+
+
+def _name_from_codeable(cc: dict[str, Any] | None) -> str | None:
+    if not cc:
+        return None
+    text = (cc.get("text") or "").strip()
+    if text:
+        return text
+    for c in cc.get("coding") or []:
+        disp = (c.get("display") or "").strip()
+        if disp:
+            return disp
+    return None
+
+
+def _humanize_name(patient: dict[str, Any]) -> str | None:
+    names = patient.get("name") or []
+    if not names:
+        return None
+    first = names[0] or {}
+    text = (first.get("text") or "").strip()
+    if text:
+        return text
+    given = " ".join(first.get("given") or []).strip()
+    family = (first.get("family") or "").strip()
+    full = f"{given} {family}".strip()
+    return full or None
+
+
+def _years_since(date_iso: str) -> int | None:
+    try:
+        from datetime import date as _date
+
+        d = _date.fromisoformat(date_iso[:10])
+    except (ValueError, TypeError):
+        return None
+    from datetime import datetime as _dt
+
+    today = _dt.now().date()
+    return today.year - d.year - ((today.month, today.day) < (d.month, d.day))
+
+
+async def chart_from_fhir(fhir: "FhirClient", patient_id: str) -> ChartFacts | None:
+    """Pull Patient + active MedicationStatement / Condition / AllergyIntolerance.
+
+    Returns None when the patient cannot be read. Failed sub-fetches degrade
+    gracefully (the corresponding list is left empty).
+    """
+    import asyncio as _asyncio
+
+    patient_task = fhir.read(f"Patient/{patient_id}")
+    meds_task = fhir.search(
+        "MedicationStatement", {"patient": patient_id, "status": "active"}
+    )
+    conds_task = fhir.search(
+        "Condition", {"patient": patient_id, "clinical-status": "active"}
+    )
+    allergies_task = fhir.search("AllergyIntolerance", {"patient": patient_id})
+
+    patient, meds_bundle, conds_bundle, allergies_bundle = await _asyncio.gather(
+        patient_task, meds_task, conds_task, allergies_task, return_exceptions=False
+    )
+    if not patient:
+        return None
+
+    birth_date = patient.get("birthDate") or ""
+    age = _years_since(birth_date) or 0
+
+    medications: list[str] = []
+    for ms in bundle_entries(meds_bundle):
+        nm = _name_from_codeable(ms.get("medicationCodeableConcept"))
+        if nm:
+            medications.append(nm)
+
+    conditions: list[str] = []
+    pregnant = False
+    for c in bundle_entries(conds_bundle):
+        nm = _name_from_codeable(c.get("code"))
+        if not nm:
+            continue
+        conditions.append(nm)
+        if "pregnan" in nm.lower():
+            pregnant = True
+
+    allergies: list[str] = []
+    for a in bundle_entries(allergies_bundle):
+        nm = _name_from_codeable(a.get("code"))
+        if nm:
+            allergies.append(nm)
+
+    return ChartFacts(
+        patient_id=patient_id,
+        name=_humanize_name(patient),
+        age=age,
+        birth_date=birth_date or None,
+        medications=medications,
+        conditions=conditions,
+        allergies=allergies,
+        pregnant=pregnant,
+    )

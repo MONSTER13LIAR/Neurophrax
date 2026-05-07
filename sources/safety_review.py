@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import beers, fhir_emit, interactions, openfda, rxclass, rxnorm
-from .sharp import FhirClient, FhirContext, bundle_entries
+from .sharp import FhirClient, FhirContext, chart_from_fhir  # noqa: F401
 
 
 # ── Severity ranking for sorting (higher = more urgent) ─────────────────────
@@ -87,68 +87,23 @@ class PatientFacts:
 # ── FHIR ingestion (SHARP path) ─────────────────────────────────────────────
 
 
-def _years_since(date_iso: str) -> int | None:
-    """Compute years between a YYYY-MM-DD string and today (UTC). None on parse error."""
-    try:
-        from datetime import date
-
-        d = date.fromisoformat(date_iso[:10])
-    except (ValueError, TypeError):
-        return None
-    today = __import__("datetime").datetime.now().date()
-    return today.year - d.year - ((today.month, today.day) < (d.month, d.day))
-
-
-def _name_from_codeable(cc: dict[str, Any] | None) -> str | None:
-    if not cc:
-        return None
-    text = (cc.get("text") or "").strip()
-    if text:
-        return text
-    for c in cc.get("coding") or []:
-        disp = (c.get("display") or "").strip()
-        if disp:
-            return disp
-    return None
-
-
 async def patient_facts_from_fhir(
     fhir: FhirClient, patient_id: str
 ) -> PatientFacts | None:
-    """Pull (age, medications, conditions, pregnant?) from a FHIR R4 server."""
-    patient_task = fhir.read(f"Patient/{patient_id}")
-    meds_task = fhir.search("MedicationStatement", {"patient": patient_id, "status": "active"})
-    conds_task = fhir.search("Condition", {"patient": patient_id, "clinical-status": "active"})
-    patient, meds_bundle, conds_bundle = await asyncio.gather(
-        patient_task, meds_task, conds_task, return_exceptions=False
-    )
-    if not patient:
+    """Pull (age, medications, conditions, pregnant?) from a FHIR R4 server.
+
+    Thin projection over :func:`sources.sharp.chart_from_fhir` so the safety
+    review and the patient-summary tool share the same FHIR fetch path.
+    """
+    chart = await chart_from_fhir(fhir, patient_id)
+    if chart is None:
         return None
-
-    age = _years_since(patient.get("birthDate") or "") or 0
-
-    medications: list[str] = []
-    for ms in bundle_entries(meds_bundle):
-        name = _name_from_codeable(ms.get("medicationCodeableConcept"))
-        if name:
-            medications.append(name)
-
-    conditions: list[str] = []
-    pregnant = False
-    for c in bundle_entries(conds_bundle):
-        name = _name_from_codeable(c.get("code"))
-        if not name:
-            continue
-        conditions.append(name)
-        if "pregnan" in name.lower():
-            pregnant = True
-
     return PatientFacts(
-        age=age,
-        medications=medications,
-        conditions=conditions,
-        pregnant=pregnant,
-        patient_id=patient_id,
+        age=chart.age,
+        medications=list(chart.medications),
+        conditions=list(chart.conditions),
+        pregnant=chart.pregnant,
+        patient_id=chart.patient_id,
         source="fhir",
     )
 
