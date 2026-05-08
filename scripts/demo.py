@@ -63,7 +63,7 @@ async def run_safety_review() -> None:
 
 async def run_trials() -> None:
     _hr()
-    print("2. find_clinical_trials — actively recruiting AF studies")
+    print("2. clinical_trial_search — actively recruiting AF studies")
     _hr()
     trials = await clinicaltrials.search_trials(
         condition="atrial fibrillation", limit=5
@@ -75,7 +75,7 @@ async def run_trials() -> None:
 
 async def run_evidence() -> None:
     _hr()
-    print("3. search_evidence — meta-analyses & RCTs on Beers-flagged combo")
+    print("3. clinical_evidence_search — meta-analyses & RCTs on Beers-flagged combo")
     _hr()
     out = await pubmed.search(
         question="elderly polypharmacy warfarin amiodarone bleeding risk",
@@ -91,7 +91,7 @@ async def run_evidence() -> None:
 
 def run_vaccines() -> None:
     _hr()
-    print("4. recommend_vaccines — ACIP recommendations for the patient context")
+    print("4. vaccine_recommendations — ACIP recommendations for the patient context")
     _hr()
     matches = vaccines.recommendations_for(
         age=SCENARIO["age"],

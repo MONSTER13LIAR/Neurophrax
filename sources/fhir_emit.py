@@ -7,6 +7,8 @@ rather than pulling a full FHIR library.
 """
 from __future__ import annotations
 
+import base64
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -85,3 +87,72 @@ def risk_assessment(
     if note:
         resource["note"] = [{"text": note}]
     return resource
+
+
+def document_reference(
+    *,
+    content_text: str,
+    title: str,
+    description: str | None = None,
+    patient_id: str | None = None,
+    type_text: str = "Clinical synthesis brief",
+    category_text: str = "Clinical Note",
+) -> dict[str, Any]:
+    """Build a FHIR ``DocumentReference`` wrapping a text narrative.
+
+    The narrative is base64-encoded into a single ``content[].attachment``.
+    Suitable for persisting an AI-generated clinical brief back to an EHR
+    alongside the structured resources it summarizes.
+    """
+    encoded = base64.b64encode(content_text.encode("utf-8")).decode("ascii")
+    resource: dict[str, Any] = {
+        "resourceType": "DocumentReference",
+        "status": "current",
+        "docStatus": "final",
+        "type": {"text": type_text},
+        "category": [{"text": category_text}],
+        "date": _now(),
+        "content": [
+            {
+                "attachment": {
+                    "contentType": "text/plain; charset=utf-8",
+                    "data": encoded,
+                    "title": title,
+                    "creation": _now(),
+                }
+            }
+        ],
+    }
+    if description:
+        resource["description"] = description
+    subject = _patient_ref(patient_id)
+    if subject:
+        resource["subject"] = subject
+    return resource
+
+
+def transaction_bundle(resources: list[dict[str, Any]]) -> dict[str, Any]:
+    """Wrap a list of FHIR resources into a transaction ``Bundle``.
+
+    Each resource gets a ``urn:uuid:`` ``fullUrl`` and a POST request entry
+    keyed to the resource's ``resourceType`` — the standard shape an EHR's
+    FHIR endpoint accepts at ``POST /[base]`` to commit them atomically.
+    """
+    entries: list[dict[str, Any]] = []
+    for res in resources:
+        rtype = res.get("resourceType")
+        if not rtype:
+            continue
+        entries.append(
+            {
+                "fullUrl": f"urn:uuid:{uuid.uuid4()}",
+                "resource": res,
+                "request": {"method": "POST", "url": rtype},
+            }
+        )
+    return {
+        "resourceType": "Bundle",
+        "type": "transaction",
+        "timestamp": _now(),
+        "entry": entries,
+    }
