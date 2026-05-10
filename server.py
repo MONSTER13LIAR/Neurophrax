@@ -124,7 +124,12 @@ async def drug_interaction_check(
     ] = None,
     ctx: Context = None,
 ) -> dict[str, Any]:
-    """Check for drug-drug interactions across every unique pair.
+    """Use this ONLY when the user asks specifically about pairwise drug-drug
+    interactions and does not need Beers Criteria, boxed warnings, or
+    duplicate-class checks. For a full medication safety review that
+    cross-references all four signals, prefer ``medication_safety_review``.
+    For a one-call patient brief (safety + evidence + vaccines + trials),
+    prefer ``prescription_safety_brief``.
 
     Primary source: bundled DDInter 2.0 dataset (severity-rated, ~160k pairs).
     Fallback: parses the OpenFDA drug label `drug_interactions` section for
@@ -132,8 +137,12 @@ async def drug_interaction_check(
     use by agents.
 
     When the request carries SHARP-on-MCP headers and ``drugs`` is omitted,
-    the tool fetches active ``MedicationStatement`` resources from the FHIR
-    server and runs the all-pair check on those.
+    the tool fetches active ``MedicationStatement`` (with ``MedicationRequest``
+    fallback) resources from the FHIR server and runs the all-pair check on
+    those. Returns ``data.chart_status`` (``"ok"`` | ``"empty_chart"`` |
+    ``"single_medication"``) — agents MUST check this before reporting "no
+    interactions found." Empty/single-med charts return a structured response,
+    not an HTTP error.
     """
     fhir_ctx = get_fhir_context(ctx)
     resolved_pid = resolve_patient_id(ctx, patientId)
@@ -327,8 +336,12 @@ async def _empty_list() -> list[dict[str, Any]]:
 async def medication_profile(
     medication: Annotated[str, Field(description="Drug name to look up")],
 ) -> dict[str, Any]:
-    """Fetch comprehensive medication info synthesized from four NLM/FDA sources.
+    """Use this when the user asks about a SINGLE medication — dosage,
+    warnings, side effects, mechanism, or patient-friendly explanation.
+    Not for multi-drug safety analysis (use ``medication_safety_review``)
+    nor pairwise interactions (use ``drug_interaction_check``).
 
+    Synthesizes from four NLM/FDA sources:
     - OpenFDA: parsed FDA label sections (dosage, warnings, adverse reactions,
       interactions, boxed warning).
     - DailyMed: links to manufacturer-specific SPLs with publication dates.
@@ -487,7 +500,11 @@ async def symptom_assessment(
         Field(min_length=1, description="Symptoms or condition terms to map"),
     ],
 ) -> dict[str, Any]:
-    """Map symptoms to clinical conditions and ICD-10-CM diagnosis codes.
+    """Use this when the user describes symptoms or needs ICD-10-CM
+    diagnosis codes / SNOMED-style condition mappings. This is a CODING
+    LOOKUP — it does not diagnose, triage, or rank likelihood. Pair with
+    ``clinical_evidence_search`` if the user wants supporting evidence on
+    the mapped conditions.
 
     Returns two parallel views per symptom: a curated FHIR Conditions Value
     Set match (with MedlinePlus consumer URL where available) and the
@@ -584,14 +601,19 @@ async def patient_summary(
     ] = None,
     ctx: Context = None,
 ) -> dict[str, Any]:
-    """Generate a structured patient summary.
+    """Use this when the user wants a quick patient overview / risk
+    snapshot (name, age, conditions, meds, allergies, heuristic risk level).
+    This is a READ-ONLY snapshot — it does NOT analyze drug safety; for
+    that use ``medication_safety_review`` or ``prescription_safety_brief``.
 
     Validates conditions against the FHIR Conditions Value Set, resolves
     medications via RxNorm, and computes a heuristic risk level.
 
     When the request carries SHARP-on-MCP headers, any omitted argument is
-    pulled from the FHIR server (Patient → name + age, MedicationStatement,
-    Condition, AllergyIntolerance). Explicit args always win over chart data.
+    pulled from the FHIR server (Patient → name + age, MedicationStatement
+    with MedicationRequest fallback, Condition, AllergyIntolerance).
+    Explicit args always win over chart data. Returns ``data.chart_status``
+    and ``data.warnings`` so agents can detect a sparsely-populated chart.
     """
     fhir_ctx = get_fhir_context(ctx)
     resolved_pid = resolve_patient_id(ctx, patientId)
@@ -800,7 +822,13 @@ async def medication_safety_review(
     ] = None,
     ctx: Context = None,
 ) -> dict[str, Any]:
-    """Composite medication safety review.
+    """Use this when the user asks "is this medication list safe?" or any
+    patient-level medication-safety question. PREFERRED tool for any
+    multi-drug + patient-context safety analysis. For an even broader
+    one-call brief that ALSO returns supporting evidence, vaccines, and
+    matching trials, use ``prescription_safety_brief`` instead.
+
+    Composite medication safety review.
 
     Cross-references four independent risk signals against patient context:
 
@@ -1047,7 +1075,10 @@ async def clinical_trial_search(
     ] = None,
     ctx: Context = None,
 ) -> dict[str, Any]:
-    """Match a patient or free-text condition to actively recruiting clinical trials.
+    """Use this when the user asks specifically about clinical trials,
+    recruitment, or research opportunities for a condition or patient.
+    For a one-call patient brief that bundles trials with safety + evidence
+    + vaccines, use ``prescription_safety_brief`` instead.
 
     Uses ClinicalTrials.gov v2. When the request carries SHARP-on-MCP headers
     and ``condition`` is omitted, the tool fetches the patient's active
@@ -1169,7 +1200,12 @@ async def clinical_evidence_search(
         int, Field(ge=1, le=30, description="Maximum citations to return.")
     ] = 10,
 ) -> dict[str, Any]:
-    """Search PubMed for clinically relevant evidence with built-in filters.
+    """Use this when the user asks for PUBLISHED EVIDENCE on a clinical
+    question — RCTs, meta-analyses, systematic reviews, or guidelines. This
+    tool is NOT patient-aware on its own; pair it with ``patient_summary``
+    or ``medication_safety_review`` if the question is patient-specific. For
+    a one-call patient brief that auto-attaches evidence to safety findings,
+    use ``prescription_safety_brief``.
 
     Composes the search with Humans + English filters and an optional study-
     type restriction (meta-analyses, RCTs, systematic reviews, guidelines)
@@ -1292,8 +1328,12 @@ async def vaccine_recommendations(
     ] = None,
     ctx: Context = None,
 ) -> dict[str, Any]:
-    """ACIP-curated adult vaccine recommendations based on age and chart conditions.
+    """Use this when the user asks specifically about vaccines, immunizations,
+    or what shots a patient is due for. For a comprehensive patient brief
+    that bundles vaccine recommendations with medication safety, evidence,
+    and matching trials, use ``prescription_safety_brief`` instead.
 
+    ACIP-curated adult vaccine recommendations based on age and chart conditions.
     Returns the routine, risk-based, and shared-decision-making vaccines
     that apply to the patient context. When SHARP/FHIR headers are present,
     the tool pulls the patient's birthDate and active conditions directly
@@ -1441,7 +1481,14 @@ async def prescription_safety_brief(
     ] = None,
     ctx: Context = None,
 ) -> dict[str, Any]:
-    """Single-call clinical brief that synthesizes safety, evidence, prevention, and trials.
+    """PREFERRED default for any patient-aware clinical question. Use this
+    when the user wants the full picture on a patient — safety analysis,
+    supporting evidence, vaccines due, and clinical trials, all in ONE call.
+    Skips the need to orchestrate ``medication_safety_review`` +
+    ``clinical_evidence_search`` + ``vaccine_recommendations`` +
+    ``clinical_trial_search`` separately.
+
+    Single-call clinical brief that synthesizes safety, evidence, prevention, and trials.
 
     Internally chains four primitives the agent would otherwise have to
     orchestrate by hand:
