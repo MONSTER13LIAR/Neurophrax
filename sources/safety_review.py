@@ -82,6 +82,9 @@ class PatientFacts:
     pregnant: bool = False
     patient_id: str | None = None
     source: str = "direct"  # "fhir" | "direct"
+    medications_source: str = "none"  # "MedicationStatement" | "MedicationRequest" | "none" | "direct"
+    unparseable_medication_ids: list[str] = field(default_factory=list)
+    unparseable_condition_ids: list[str] = field(default_factory=list)
 
 
 # ── FHIR ingestion (SHARP path) ─────────────────────────────────────────────
@@ -105,6 +108,9 @@ async def patient_facts_from_fhir(
         pregnant=chart.pregnant,
         patient_id=chart.patient_id,
         source="fhir",
+        medications_source=chart.medications_source,
+        unparseable_medication_ids=list(chart.unparseable_medication_ids),
+        unparseable_condition_ids=list(chart.unparseable_condition_ids),
     )
 
 
@@ -155,8 +161,15 @@ def _label_text(label: dict[str, Any] | None, key: str) -> str:
 
 
 def _atc_l3_prefix(class_id: str) -> str:
-    """Return the first 5 characters (ATC level-3 'pharmacological subgroup')."""
-    return class_id[:5] if class_id else ""
+    """Return the ATC level-3 'pharmacological/therapeutic subgroup' prefix.
+
+    ATC code structure: L1=1 char, L2=3 chars, L3=4 chars, L4=5 chars, L5=7
+    chars. Level 3 is the standard granularity for "duplicate therapeutic
+    class" safety checks: two anticoagulants from different L4 chemical
+    subgroups (e.g., warfarin B01AA03 and apixaban B01AF02) still share the
+    L3 antithrombotic class B01A and concurrent use is clinically dangerous.
+    """
+    return class_id[:4] if class_id else ""
 
 
 def _interaction_findings(
@@ -304,6 +317,7 @@ class ReviewResult:
     facts: list[MedFacts]
     patient: PatientFacts
     fhir_resource: dict[str, Any]
+    unresolved_medications: list[str] = field(default_factory=list)
 
 
 async def run(patient: PatientFacts) -> ReviewResult:
@@ -319,6 +333,7 @@ async def run(patient: PatientFacts) -> ReviewResult:
                 method_text="Neurophrax composite medication safety review",
                 note="No active medications were available for review.",
             ),
+            unresolved_medications=[],
         )
         return empty
 
@@ -328,6 +343,7 @@ async def run(patient: PatientFacts) -> ReviewResult:
         *[rxnorm.name_to_rxcui(m) for m in patient.medications]
     )
     facts, rxcuis = await asyncio.gather(facts_task, rxcuis_task)
+    unresolved_medications = [m for m, c in zip(patient.medications, rxcuis) if not c]
     inter_results, _counts = await interactions.check_pairs(patient.medications, rxcuis)
 
     findings: list[Finding] = []
@@ -355,4 +371,5 @@ async def run(patient: PatientFacts) -> ReviewResult:
         facts=facts,
         patient=patient,
         fhir_resource=fhir_resource,
+        unresolved_medications=unresolved_medications,
     )

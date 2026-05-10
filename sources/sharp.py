@@ -133,6 +133,10 @@ class ChartFacts:
     conditions: list[str] = None  # type: ignore[assignment]
     allergies: list[str] = None  # type: ignore[assignment]
     pregnant: bool = False
+    medications_source: str = "none"  # "MedicationStatement" | "MedicationRequest" | "none"
+    unparseable_medication_ids: list[str] = None  # type: ignore[assignment]
+    unparseable_condition_ids: list[str] = None  # type: ignore[assignment]
+    unparseable_allergy_ids: list[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.medications is None:
@@ -141,6 +145,12 @@ class ChartFacts:
             self.conditions = []
         if self.allergies is None:
             self.allergies = []
+        if self.unparseable_medication_ids is None:
+            self.unparseable_medication_ids = []
+        if self.unparseable_condition_ids is None:
+            self.unparseable_condition_ids = []
+        if self.unparseable_allergy_ids is None:
+            self.unparseable_allergy_ids = []
 
 
 def _name_from_codeable(cc: dict[str, Any] | None) -> str | None:
@@ -200,9 +210,16 @@ async def chart_from_fhir(fhir: "FhirClient", patient_id: str) -> ChartFacts | N
     )
     allergies_task = fhir.search("AllergyIntolerance", {"patient": patient_id})
 
-    patient, meds_bundle, conds_bundle, allergies_bundle = await _asyncio.gather(
-        patient_task, meds_task, conds_task, allergies_task, return_exceptions=False
+    # Use return_exceptions=True so a single resource type that the FHIR
+    # server rejects (e.g., some sandboxes don't allow AllergyIntolerance
+    # search by patient) doesn't drop the whole chart on the floor.
+    results = await _asyncio.gather(
+        patient_task, meds_task, conds_task, allergies_task, return_exceptions=True
     )
+    patient = results[0] if not isinstance(results[0], BaseException) else None
+    meds_bundle = results[1] if not isinstance(results[1], BaseException) else None
+    conds_bundle = results[2] if not isinstance(results[2], BaseException) else None
+    allergies_bundle = results[3] if not isinstance(results[3], BaseException) else None
     if not patient:
         return None
 
@@ -210,26 +227,57 @@ async def chart_from_fhir(fhir: "FhirClient", patient_id: str) -> ChartFacts | N
     age = _years_since(birth_date) or 0
 
     medications: list[str] = []
+    unparseable_med_ids: list[str] = []
+    medications_source = "none"
     for ms in bundle_entries(meds_bundle):
         nm = _name_from_codeable(ms.get("medicationCodeableConcept"))
         if nm:
             medications.append(nm)
+        else:
+            unparseable_med_ids.append(str(ms.get("id") or "<no-id>"))
+    if medications:
+        medications_source = "MedicationStatement"
+
+    # Many EHR FHIR servers populate MedicationRequest (provider intent) but
+    # not MedicationStatement (patient attestation). Fall back when the
+    # primary resource yielded zero parseable meds, so safety review isn't
+    # silently performed against an empty list.
+    if not medications:
+        try:
+            mreq_bundle = await fhir.search(
+                "MedicationRequest", {"patient": patient_id, "status": "active"}
+            )
+        except Exception:
+            mreq_bundle = None
+        for mr in bundle_entries(mreq_bundle):
+            nm = _name_from_codeable(mr.get("medicationCodeableConcept"))
+            if nm:
+                medications.append(nm)
+            else:
+                unparseable_med_ids.append(str(mr.get("id") or "<no-id>"))
+        if medications:
+            medications_source = "MedicationRequest"
 
     conditions: list[str] = []
+    unparseable_cond_ids: list[str] = []
     pregnant = False
     for c in bundle_entries(conds_bundle):
         nm = _name_from_codeable(c.get("code"))
         if not nm:
+            unparseable_cond_ids.append(str(c.get("id") or "<no-id>"))
             continue
         conditions.append(nm)
         if "pregnan" in nm.lower():
             pregnant = True
 
     allergies: list[str] = []
+    unparseable_allergy_ids: list[str] = []
     for a in bundle_entries(allergies_bundle):
         nm = _name_from_codeable(a.get("code"))
         if nm:
             allergies.append(nm)
+        else:
+            unparseable_allergy_ids.append(str(a.get("id") or "<no-id>"))
 
     return ChartFacts(
         patient_id=patient_id,
@@ -240,4 +288,8 @@ async def chart_from_fhir(fhir: "FhirClient", patient_id: str) -> ChartFacts | N
         conditions=conditions,
         allergies=allergies,
         pregnant=pregnant,
+        medications_source=medications_source,
+        unparseable_medication_ids=unparseable_med_ids,
+        unparseable_condition_ids=unparseable_cond_ids,
+        unparseable_allergy_ids=unparseable_allergy_ids,
     )

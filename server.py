@@ -139,8 +139,11 @@ async def drug_interaction_check(
     resolved_pid = resolve_patient_id(ctx, patientId)
     fhir_error: str | None = None
     source = "direct"
+    chart: Any = None
+    used_fhir = False
 
     if not drugs and fhir_ctx and resolved_pid:
+        used_fhir = True
         try:
             chart = await chart_from_fhir(FhirClient(fhir_ctx), resolved_pid)
             if chart and chart.medications:
@@ -149,10 +152,68 @@ async def drug_interaction_check(
         except Exception as exc:
             fhir_error = f"FHIR fetch failed: {exc}"
 
-    if not drugs or len(drugs) < 2:
+    # Genuine missing-input — agent gave nothing to work with.
+    if not drugs and not used_fhir:
         raise ValueError(
-            "Provide at least two drug names, or call with SHARP/FHIR patient context "
-            "that has at least two active MedicationStatement resources."
+            "Provide at least two drug names, or call with SHARP/FHIR patient context."
+        )
+
+    # FHIR was attempted but returned 0 or 1 medications — return a structured
+    # empty/degraded response so the foreign agent can distinguish this from
+    # "checked, no interactions found."
+    if not drugs or len(drugs) < 2:
+        n = len(drugs or [])
+        chart_status = "empty_chart" if n == 0 else "single_medication"
+        meds_src = chart.medications_source if chart else "none"
+        warnings = [
+            (
+                "FHIR chart contained 0 active medications "
+                "(checked MedicationStatement and MedicationRequest with status=active). "
+                "Cannot run pairwise interaction check."
+                if n == 0 else
+                f"FHIR chart contained only 1 active medication ({(drugs or ['?'])[0]}). "
+                "Pairwise interaction check needs ≥2 drugs."
+            )
+        ]
+        if chart and chart.unparseable_medication_ids:
+            warnings.append(
+                f"{len(chart.unparseable_medication_ids)} medication entry/entries had "
+                f"missing code/display and were dropped: {chart.unparseable_medication_ids}."
+            )
+        return _response(
+            summary="\n".join([
+                "╔══════════════════════════════════════════════════╗",
+                "║        NEUROPHRAX — DRUG INTERACTION CHECK       ║",
+                "╚══════════════════════════════════════════════════╝",
+                f"  Source       : FHIR R4 (SHARP context, meds via {meds_src})",
+                f"  Patient ID   : {resolved_pid or '—'}",
+                f"  Medications  : {n}",
+                f"  Chart Status : {chart_status}",
+                "",
+                *(f"  ⚠️  {w}" for w in warnings),
+                "",
+                "  ⛔ NO CHECK PERFORMED — insufficient medications. This is NOT",
+                "     equivalent to 'no interactions found'.",
+                "",
+                f"  ⚕️  DISCLAIMER: {DISCLAIMER}",
+            ]),
+            data={
+                "queried_drugs": list(drugs or []),
+                "resolved_rxcuis": {},
+                "unresolved": [],
+                "interactions": [],
+                "source_counts": {"ddinter": 0, "openfda_label": 0},
+                "ddinter_version": interactions.dataset_version(),
+                "patient_id": resolved_pid,
+                "source": "fhir",
+                "chart_status": chart_status,
+                "warnings": warnings,
+                "medications_source": meds_src,
+                "fhir_error": fhir_error,
+            },
+            sources=[
+                {"name": "FHIR R4 Server", "url": fhir_ctx.url if fhir_ctx else None, "accessed_at": _now()},
+            ],
         )
 
     rxcui_results = await asyncio.gather(*[rxnorm.name_to_rxcui(d) for d in drugs])
@@ -219,6 +280,19 @@ async def drug_interaction_check(
 
     lines.append(f"  ⚕️  DISCLAIMER: {DISCLAIMER}")
 
+    warnings: list[str] = []
+    if unresolved:
+        warnings.append(
+            f"{len(unresolved)} of {len(drugs)} drug(s) could not be normalized via RxNorm: "
+            f"{unresolved}. Interaction lookup against DDInter relies on RxCUIs, so "
+            "interactions involving these drugs may not have been detected."
+        )
+    if chart and chart.unparseable_medication_ids:
+        warnings.append(
+            f"{len(chart.unparseable_medication_ids)} medication entry/entries had missing "
+            f"code/display and were dropped: {chart.unparseable_medication_ids}."
+        )
+
     return _response(
         summary="\n".join(lines),
         data={
@@ -230,6 +304,9 @@ async def drug_interaction_check(
             "ddinter_version": ddinter_version,
             "patient_id": resolved_pid,
             "source": source,
+            "chart_status": "ok",
+            "warnings": warnings,
+            "medications_source": chart.medications_source if chart else ("fhir" if source == "fhir" else "direct"),
             "fhir_error": fhir_error,
         },
         sources=sources_meta,
@@ -520,6 +597,8 @@ async def patient_summary(
     resolved_pid = resolve_patient_id(ctx, patientId)
     fhir_error: str | None = None
     chart_source = "direct"
+    chart: Any = None
+    medications_source = "direct"
 
     if fhir_ctx and resolved_pid and (
         name is None or age is None or conditions is None or medications is None or allergies is None
@@ -528,6 +607,7 @@ async def patient_summary(
             chart = await chart_from_fhir(FhirClient(fhir_ctx), resolved_pid)
             if chart is not None:
                 chart_source = "fhir"
+                medications_source = chart.medications_source
                 if name is None:
                     name = chart.name
                 if age is None:
@@ -619,6 +699,33 @@ async def patient_summary(
         lines += ["", "  RXNORM MEDICATION IDs:", ""]
         for med, cid in rxnorm_map.items():
             lines.append(f"    {med.title()} → RxCUI {cid}")
+
+    warnings: list[str] = []
+    if chart and chart.unparseable_medication_ids:
+        warnings.append(
+            f"{len(chart.unparseable_medication_ids)} medication FHIR entry/entries had "
+            f"missing code/display: {chart.unparseable_medication_ids}."
+        )
+    if chart and chart.unparseable_condition_ids:
+        warnings.append(
+            f"{len(chart.unparseable_condition_ids)} condition FHIR entry/entries had "
+            f"missing code/display: {chart.unparseable_condition_ids}."
+        )
+    if chart and chart.unparseable_allergy_ids:
+        warnings.append(
+            f"{len(chart.unparseable_allergy_ids)} allergy FHIR entry/entries had "
+            f"missing code/display: {chart.unparseable_allergy_ids}."
+        )
+    chart_status = "ok"
+    if chart_source == "fhir" and not medications and not conditions:
+        chart_status = "empty_chart"
+        warnings.insert(
+            0,
+            "FHIR chart returned no active medications and no active conditions. "
+            "Patient summary may reflect a sparsely-populated record rather than a healthy patient.",
+        )
+    if warnings:
+        lines += ["", "  ⚠️  WARNINGS:", *(f"     • {w}" for w in warnings)]
     lines += ["", f"  ⚕️  DISCLAIMER: {DISCLAIMER}"]
 
     return _response(
@@ -630,6 +737,7 @@ async def patient_summary(
                 "last_visit": last_visit,
                 "patient_id": resolved_pid,
                 "source": chart_source,
+                "medications_source": medications_source,
             },
             "conditions": conditions,
             "medications": medications,
@@ -637,6 +745,11 @@ async def patient_summary(
             "risk": {"level": risk, "reasons": risk_reasons},
             "condition_lookups": condition_lookups,
             "rxnorm_map": rxnorm_map,
+            "chart_status": chart_status,
+            "warnings": warnings,
+            "unparseable_medication_ids": list(chart.unparseable_medication_ids) if chart else [],
+            "unparseable_condition_ids": list(chart.unparseable_condition_ids) if chart else [],
+            "unparseable_allergy_ids": list(chart.unparseable_allergy_ids) if chart else [],
             "fhir_error": fhir_error,
         },
         sources=[
@@ -705,6 +818,17 @@ async def medication_safety_review(
     Returns a single prioritized risk list, with each finding tagged by
     severity, rationale, and recommended mitigation. Output includes a FHIR
     ``RiskAssessment`` resource ready to persist back to the patient's record.
+
+    The response payload also exposes ``data.chart_status`` (``"ok"`` or
+    ``"empty_chart"``), ``data.warnings`` (human-readable caveats),
+    ``data.unresolved_medications`` (drug names RxNorm could not normalize —
+    interaction lookup may be incomplete for these), and
+    ``data.unparseable_medication_ids`` / ``data.unparseable_condition_ids``
+    (FHIR entries with missing code/display, dropped from the chart). Agents
+    consuming this tool MUST check these fields before reporting safety:
+    ``chart_status="empty_chart"`` means the chart was fetched but contained
+    zero active medications, so no review was performed — this is NOT
+    equivalent to "no safety signals."
     """
     fhir_ctx = get_fhir_context(ctx)
     resolved_pid = resolve_patient_id(ctx, patientId)
@@ -731,10 +855,45 @@ async def medication_safety_review(
             pregnant=pregnant,
             patient_id=resolved_pid,
             source="direct",
+            medications_source="direct",
         )
+
+    # Distinguish "FHIR chart fetched, but contained zero active meds" from
+    # "checked, found nothing" — the latter is vacuously true for an empty
+    # input set and will mislead any downstream agent into reporting safety.
+    chart_status = "ok"
+    if patient_facts.source == "fhir" and not patient_facts.medications:
+        chart_status = "empty_chart"
 
     review = await safety_review.run(patient_facts)
     findings = review.findings
+    unresolved_medications = review.unresolved_medications
+
+    warnings: list[str] = []
+    if chart_status == "empty_chart":
+        warnings.append(
+            "FHIR chart was fetched but contained 0 active medications "
+            "(checked MedicationStatement and MedicationRequest with status=active). "
+            "Safety review was not performed — there is no data to assess."
+        )
+    if patient_facts.unparseable_medication_ids:
+        warnings.append(
+            f"{len(patient_facts.unparseable_medication_ids)} medication entry/entries could not "
+            f"be parsed (missing code/display): {patient_facts.unparseable_medication_ids}. "
+            "Chart context may be incomplete."
+        )
+    if patient_facts.unparseable_condition_ids:
+        warnings.append(
+            f"{len(patient_facts.unparseable_condition_ids)} condition entry/entries could not "
+            f"be parsed: {patient_facts.unparseable_condition_ids}."
+        )
+    if unresolved_medications:
+        warnings.append(
+            f"{len(unresolved_medications)} of {len(patient_facts.medications)} medication(s) "
+            f"could not be normalized via RxNorm: {unresolved_medications}. "
+            "Interaction lookup against DDInter relies on RxCUIs, so interactions involving "
+            "these drugs may not have been detected."
+        )
 
     sources_meta: list[dict[str, Any]] = [
         {"name": "RxNorm", "url": rxnorm.BASE, "accessed_at": _now()},
@@ -768,16 +927,23 @@ async def medication_safety_review(
     for f in findings:
         counts[f.category] = counts.get(f.category, 0) + 1
 
+    if patient_facts.source == "fhir":
+        meds_src = patient_facts.medications_source or "none"
+        source_label = f"FHIR R4 (SHARP context, meds via {meds_src})"
+    else:
+        source_label = "Direct input"
+
     lines = [
         "╔══════════════════════════════════════════════════╗",
         "║      NEUROPHRAX — MEDICATION SAFETY REVIEW       ║",
         "╚══════════════════════════════════════════════════╝",
-        f"  Source       : {'FHIR R4 (SHARP context)' if patient_facts.source == 'fhir' else 'Direct input'}",
+        f"  Source       : {source_label}",
         f"  Patient ID   : {patient_facts.patient_id or '—'}",
         f"  Age          : {patient_facts.age} years",
         f"  Medications  : {len(patient_facts.medications)}  ({', '.join(m.title() for m in patient_facts.medications) or '—'})",
         f"  Conditions   : {len(patient_facts.conditions)}",
         f"  Pregnant     : {'Yes' if patient_facts.pregnant else 'No'}",
+        f"  Chart Status : {chart_status}",
         "",
         f"  ◇ {len(findings)} finding(s)"
         + (f"   [interactions={counts.get('interaction', 0)}, beers={counts.get('beers', 0)}, "
@@ -787,10 +953,20 @@ async def medication_safety_review(
     ]
     if fhir_error:
         lines += [f"  ⚠️  {fhir_error} — used direct args.", ""]
+    for w in warnings:
+        lines += [f"  ⚠️  {w}", ""]
 
-    if not findings:
+    if chart_status == "empty_chart":
         lines += [
-            "  ✅ No safety signals matched.",
+            "  ⛔ NO REVIEW PERFORMED — empty medication list from FHIR chart.",
+            "     This is NOT a clean bill of health. The agent should ask the user",
+            "     to verify the FHIR server populates MedicationStatement or",
+            "     MedicationRequest, or pass `medications` and `age` explicitly.",
+        ]
+    elif not findings:
+        lines += [
+            "  ✅ No safety signals matched across all four signal types",
+            f"     (checked {len(patient_facts.medications)} medication(s)).",
             "     Continue routine pharmacist review and monitoring.",
         ]
     else:
@@ -816,7 +992,13 @@ async def medication_safety_review(
                 "conditions": patient_facts.conditions,
                 "pregnant": patient_facts.pregnant,
                 "source": patient_facts.source,
+                "medications_source": patient_facts.medications_source,
             },
+            "chart_status": chart_status,
+            "warnings": warnings,
+            "unresolved_medications": unresolved_medications,
+            "unparseable_medication_ids": patient_facts.unparseable_medication_ids,
+            "unparseable_condition_ids": patient_facts.unparseable_condition_ids,
             "findings": [f.to_dict() for f in findings],
             "fhir": {"RiskAssessment": review.fhir_resource},
             "fhir_error": fhir_error,
@@ -1122,6 +1304,7 @@ async def vaccine_recommendations(
     resolved_pid = resolve_patient_id(ctx, patientId)
     fhir_error: str | None = None
     source = "direct"
+    facts: safety_review.PatientFacts | None = None
 
     if (age is None) and fhir_ctx and resolved_pid:
         try:
@@ -1175,6 +1358,14 @@ async def vaccine_recommendations(
 
     lines.append(f"  ⚕️  DISCLAIMER: {DISCLAIMER}")
 
+    warnings: list[str] = []
+    if facts and facts.unparseable_condition_ids:
+        warnings.append(
+            f"{len(facts.unparseable_condition_ids)} condition FHIR entry/entries had missing "
+            f"code/display: {facts.unparseable_condition_ids}. Risk-based vaccine matching may "
+            "be incomplete."
+        )
+
     return _response(
         summary="\n".join(lines),
         data={
@@ -1195,6 +1386,9 @@ async def vaccine_recommendations(
                 }
                 for r in matches
             ],
+            "chart_status": "ok",
+            "warnings": warnings,
+            "unparseable_condition_ids": list(facts.unparseable_condition_ids) if facts else [],
             "fhir": {"ImmunizationRecommendation": fhir_resource},
             "fhir_error": fhir_error,
         },
@@ -1298,7 +1492,12 @@ async def prescription_safety_brief(
             pregnant=pregnant,
             patient_id=resolved_pid,
             source="direct",
+            medications_source="direct",
         )
+
+    chart_status = "empty_chart" if (
+        patient_facts.source == "fhir" and not patient_facts.medications
+    ) else "ok"
 
     brief = await safety_brief.compose(
         patient_facts,
@@ -1355,7 +1554,33 @@ async def prescription_safety_brief(
         for r in brief.vaccine_rules
     ]
 
+    warnings: list[str] = []
+    if chart_status == "empty_chart":
+        warnings.append(
+            "FHIR chart was fetched but contained 0 active medications "
+            "(checked MedicationStatement and MedicationRequest with status=active). "
+            "Safety brief was generated against an empty medication list — findings, "
+            "vaccine recommendations, and trial matches reflect chart conditions only, "
+            "not pharmacotherapy."
+        )
+    if patient_facts.unparseable_medication_ids:
+        warnings.append(
+            f"{len(patient_facts.unparseable_medication_ids)} medication entry/entries had "
+            f"missing code/display: {patient_facts.unparseable_medication_ids}."
+        )
+    if patient_facts.unparseable_condition_ids:
+        warnings.append(
+            f"{len(patient_facts.unparseable_condition_ids)} condition entry/entries had "
+            f"missing code/display: {patient_facts.unparseable_condition_ids}."
+        )
+
     summary = render_brief_summary(brief, fhir_error=fhir_error)
+    if warnings:
+        summary = (
+            summary
+            + "\n\n  ⚠️  WARNINGS:\n"
+            + "\n".join(f"     • {w}" for w in warnings)
+        )
 
     return _response(
         summary=summary,
@@ -1367,7 +1592,12 @@ async def prescription_safety_brief(
                 "conditions": patient_facts.conditions,
                 "pregnant": patient_facts.pregnant,
                 "source": patient_facts.source,
+                "medications_source": patient_facts.medications_source,
             },
+            "chart_status": chart_status,
+            "warnings": warnings,
+            "unparseable_medication_ids": list(patient_facts.unparseable_medication_ids),
+            "unparseable_condition_ids": list(patient_facts.unparseable_condition_ids),
             "findings": findings_payload,
             "vaccine_recommendations": vaccine_payload,
             "trials": brief.trial_blocks,
