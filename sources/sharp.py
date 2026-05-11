@@ -223,6 +223,22 @@ async def chart_from_fhir(fhir: "FhirClient", patient_id: str) -> ChartFacts | N
     if not patient:
         return None
 
+    # Some FHIR sandboxes (and some configurations of HAPI) don't index the
+    # MedicationStatement.status or Condition.clinicalStatus token params, so
+    # the filtered searches return zero entries even when the resources exist.
+    # When the filtered query came back empty, retry without the status filter
+    # and rely on each resource's own status field for the active/inactive cut.
+    if not bundle_entries(meds_bundle):
+        try:
+            meds_bundle = await fhir.search("MedicationStatement", {"patient": patient_id})
+        except Exception:
+            pass
+    if not bundle_entries(conds_bundle):
+        try:
+            conds_bundle = await fhir.search("Condition", {"patient": patient_id})
+        except Exception:
+            pass
+
     birth_date = patient.get("birthDate") or ""
     age = _years_since(birth_date) or 0
 
@@ -230,6 +246,11 @@ async def chart_from_fhir(fhir: "FhirClient", patient_id: str) -> ChartFacts | N
     unparseable_med_ids: list[str] = []
     medications_source = "none"
     for ms in bundle_entries(meds_bundle):
+        # Respect status on the resource itself — needed when the server
+        # didn't honor `status=active` and returned everything.
+        st = (ms.get("status") or "").lower()
+        if st and st not in ("active", "intended"):
+            continue
         nm = _name_from_codeable(ms.get("medicationCodeableConcept"))
         if nm:
             medications.append(nm)
@@ -249,7 +270,15 @@ async def chart_from_fhir(fhir: "FhirClient", patient_id: str) -> ChartFacts | N
             )
         except Exception:
             mreq_bundle = None
+        if not bundle_entries(mreq_bundle):
+            try:
+                mreq_bundle = await fhir.search("MedicationRequest", {"patient": patient_id})
+            except Exception:
+                pass
         for mr in bundle_entries(mreq_bundle):
+            st = (mr.get("status") or "").lower()
+            if st and st not in ("active", "draft"):
+                continue
             nm = _name_from_codeable(mr.get("medicationCodeableConcept"))
             if nm:
                 medications.append(nm)
@@ -262,6 +291,16 @@ async def chart_from_fhir(fhir: "FhirClient", patient_id: str) -> ChartFacts | N
     unparseable_cond_ids: list[str] = []
     pregnant = False
     for c in bundle_entries(conds_bundle):
+        # Filter on clinicalStatus when present — needed for fallback queries
+        # that returned both active and resolved/inactive conditions.
+        cs_code = None
+        for coding in (c.get("clinicalStatus") or {}).get("coding") or []:
+            code = (coding.get("code") or "").lower()
+            if code:
+                cs_code = code
+                break
+        if cs_code and cs_code not in ("active", "recurrence", "relapse"):
+            continue
         nm = _name_from_codeable(c.get("code"))
         if not nm:
             unparseable_cond_ids.append(str(c.get("id") or "<no-id>"))

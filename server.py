@@ -614,6 +614,26 @@ async def patient_summary(
     with MedicationRequest fallback, Condition, AllergyIntolerance).
     Explicit args always win over chart data. Returns ``data.chart_status``
     and ``data.warnings`` so agents can detect a sparsely-populated chart.
+
+    GUIDANCE FOR FOREIGN AGENTS:
+
+    1. Use ``data.condition_lookups[*].matched_name`` as the canonical name
+       when describing patient conditions to the user. Do NOT paraphrase or
+       reinterpret conditions — e.g., "G6PD deficiency" is an enzyme
+       deficiency that may cause hemolytic anemia under specific triggers,
+       NOT a chronic anemia. Mis-paraphrasing changes clinical meaning.
+
+    2. When ``data.medications_documented`` is ``false``, you MUST tell the
+       user explicitly that no medications are documented in the chart, and
+       that drug-induced effects (orthostasis, sedation, hypoglycemia,
+       cognitive effects) cannot be ruled out from this snapshot alone.
+       Verify with the user about OTCs, supplements, and recent changes.
+       An empty chart medication list is NOT equivalent to "patient takes
+       no medications."
+
+    3. ``data.chart_status`` is ``"empty_chart"`` only when both meds AND
+       conditions are empty. Use ``data.medications_documented`` and
+       ``data.conditions_documented`` for finer-grained signals.
     """
     fhir_ctx = get_fhir_context(ctx)
     resolved_pid = resolve_patient_id(ctx, patientId)
@@ -722,7 +742,22 @@ async def patient_summary(
         for med, cid in rxnorm_map.items():
             lines.append(f"    {med.title()} → RxCUI {cid}")
 
+    medications_documented = len(medications) > 0
+    conditions_documented = len(conditions) > 0
+
     warnings: list[str] = []
+    if not medications_documented:
+        warnings.append(
+            "No active medications documented in chart. Drug-induced effects "
+            "(orthostasis, sedation, hypoglycemia, cognitive change) CANNOT be "
+            "ruled out from this snapshot. Verify OTCs, supplements, herbals, "
+            "and recent prescription changes with the patient."
+        )
+    if chart_source == "fhir" and not conditions_documented:
+        warnings.append(
+            "No active conditions documented in chart. Comorbidity-driven risk "
+            "(falls, polypharmacy, frailty) cannot be assessed from this snapshot."
+        )
     if chart and chart.unparseable_medication_ids:
         warnings.append(
             f"{len(chart.unparseable_medication_ids)} medication FHIR entry/entries had "
@@ -764,6 +799,8 @@ async def patient_summary(
             "conditions": conditions,
             "medications": medications,
             "allergies": allergies,
+            "medications_documented": medications_documented,
+            "conditions_documented": conditions_documented,
             "risk": {"level": risk, "reasons": risk_reasons},
             "condition_lookups": condition_lookups,
             "rxnorm_map": rxnorm_map,
